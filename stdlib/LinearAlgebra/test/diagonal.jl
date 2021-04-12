@@ -88,7 +88,7 @@ Random.seed!(1)
             @test func(D) ≈ func(DM) atol=n^2*eps(relty)*(1+(elty<:Complex))
         end
         if relty <: BlasFloat
-            for func in (exp, sinh, cosh, tanh, sech, csch, coth)
+            for func in (exp, cis, sinh, cosh, tanh, sech, csch, coth)
                 @test func(D) ≈ func(DM) atol=n^3*eps(relty)
             end
             @test log(Diagonal(abs.(D.diag))) ≈ log(abs.(DM)) atol=n^3*eps(relty)
@@ -100,6 +100,10 @@ Random.seed!(1)
                 @test func(D) ≈ func(DM) atol=n^2*eps(relty)*2
             end
         end
+    end
+
+    @testset "Two-dimensional Euler formula for Diagonal" begin
+        @test cis(Diagonal([π, π])) ≈ -I
     end
 
     @testset "Linear solve" begin
@@ -361,6 +365,8 @@ Random.seed!(1)
         d2, s2 = logabsdet(lM)
         @test d1 ≈ d2
         @test s1 == s2
+        @test logdet(Diagonal(relty[-1,-2])) ≈ log(2)
+        @test_throws DomainError logdet(Diagonal(relty[-1,-2,-3]))
     end
 
     @testset "similar" begin
@@ -566,11 +572,19 @@ end
     @test ishermitian(Dsym) == false
 
     @test exp(D) == Diagonal([exp([1 2; 3 4]), exp([1 2; 3 4])])
+    @test cis(D) == Diagonal([cis([1 2; 3 4]), cis([1 2; 3 4])])
     @test log(D) == Diagonal([log([1 2; 3 4]), log([1 2; 3 4])])
     @test sqrt(D) == Diagonal([sqrt([1 2; 3 4]), sqrt([1 2; 3 4])])
 
     @test tr(D) == 10
     @test det(D) == 4
+
+    # sparse matrix block diagonals
+    s = SparseArrays.sparse([1 2; 3 4])
+    D = Diagonal([s, s])
+    @test D[1, 1] == s
+    @test D[1, 2] == zero(s)
+    @test isa(D[2, 1], SparseMatrixCSC)
 end
 
 @testset "linear solve for block diagonal matrices" begin
@@ -644,6 +658,15 @@ end
     @test yt*D*y == (yt*D)*y == (yt*A)*y
 end
 
+@testset "Multiplication of single element Diagonal (#36746)" begin
+    @test_throws DimensionMismatch Diagonal(randn(1)) * randn(5)
+    @test_throws DimensionMismatch Diagonal(randn(1)) * Diagonal(randn(3, 3))
+    A = [1 0; 0 2]
+    v = [3, 4]
+    @test Diagonal(A) * v == A * v
+    @test Diagonal(A) * Diagonal(A) == A * A
+end
+
 @testset "Triangular division by Diagonal #27989" begin
     K = 5
     for elty in (Float32, Float64, ComplexF32, ComplexF64)
@@ -715,6 +738,15 @@ end
     @test zeros(0)'*Diagonal(zeros(0))*zeros(0) === 0.0
     @test transpose(zeros(0))*Diagonal(zeros(Complex{Int}, 0))*zeros(0) === 0.0 + 0.0im
     @test dot(zeros(Int32, 0), Diagonal(zeros(Int, 0)), zeros(Int16, 0)) === 0
+end
+
+@testset "Inner product" begin
+    A = Diagonal(rand(10) .+ im)
+    B = Diagonal(rand(10) .+ im)
+    @test dot(A, B) ≈ dot(Matrix(A), B)
+    @test dot(A, B) ≈ dot(A, Matrix(B))
+    @test dot(A, B) ≈ dot(Matrix(A), Matrix(B))
+    @test dot(A, B) ≈ conj(dot(B, A))
 end
 
 end # module TestDiagonal

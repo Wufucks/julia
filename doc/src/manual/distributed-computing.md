@@ -87,7 +87,7 @@ julia> remotecall_fetch(getindex, 2, r, 1, 1)
 Remember that [`getindex(r,1,1)`](@ref) is [equivalent](@ref man-array-indexing) to `r[1,1]`, so this call fetches
 the first element of the future `r`.
 
-To make things easier, the symbol `:any` can be passed to [`@spawnat`], which picks where to do
+To make things easier, the symbol `:any` can be passed to [`@spawnat`](@ref), which picks where to do
 the operation for you:
 
 ```julia-repl
@@ -580,7 +580,7 @@ julia> function make_jobs(n)
 
 julia> n = 12;
 
-julia> @async make_jobs(n); # feed the jobs channel with "n" jobs
+julia> errormonitor(@async make_jobs(n)); # feed the jobs channel with "n" jobs
 
 julia> for p in workers() # start tasks on the workers to process requests in parallel
            remote_do(do_work, p, jobs, results)

@@ -49,6 +49,8 @@ Base.:(~)
 Base.:(&)
 Base.:(|)
 Base.xor
+Base.nand
+Base.nor
 Base.:(!)
 &&
 ||
@@ -162,6 +164,7 @@ Base.reim
 Base.conj
 Base.angle
 Base.cis
+Base.cispi
 Base.binomial
 Base.factorial
 Base.gcd
@@ -198,7 +201,7 @@ and
 \oplus `⊕`
 
 The complete list is in the parser code:
-https://github.com/JuliaLang/julia/blob/master/src/julia-parser.scm
+<https://github.com/JuliaLang/julia/blob/master/src/julia-parser.scm>
 
 Those that are parsed like `*` (in terms of precedence) include
 `* / ÷ % & ⋅ ∘ × |\\| ∩ ∧ ⊗ ⊘ ⊙ ⊚ ⊛ ⊠ ⊡ ⊓ ∗ ∙ ∤ ⅋ ≀ ⊼ ⋄ ⋆ ⋇ ⋉ ⋊ ⋋ ⋌ ⋏ ⋒ ⟑ ⦸ ⦼ ⦾ ⦿ ⧶ ⧷ ⨇ ⨰ ⨱ ⨲ ⨳ ⨴ ⨵ ⨶ ⨷ ⨸ ⨻ ⨼ ⨽ ⩀ ⩃ ⩄ ⩋ ⩍ ⩎ ⩑ ⩓ ⩕ ⩘ ⩚ ⩜ ⩞ ⩟ ⩠ ⫛ ⊍ ▷ ⨝ ⟕ ⟖ ⟗`

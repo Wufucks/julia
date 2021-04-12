@@ -188,19 +188,19 @@ in which case `combine` defaults to `|`.
 julia> II = [1, 3, 3, 5]; V = [0.1, 0.2, 0.3, 0.2];
 
 julia> sparsevec(II, V)
-5-element SparseVector{Float64,Int64} with 3 stored entries:
+5-element SparseVector{Float64, Int64} with 3 stored entries:
   [1]  =  0.1
   [3]  =  0.5
   [5]  =  0.2
 
 julia> sparsevec(II, V, 8, -)
-8-element SparseVector{Float64,Int64} with 3 stored entries:
+8-element SparseVector{Float64, Int64} with 3 stored entries:
   [1]  =  0.1
   [3]  =  -0.1
   [5]  =  0.2
 
 julia> sparsevec([1, 3, 1, 2, 2], [true, true, false, false, false])
-3-element SparseVector{Bool,Int64} with 3 stored entries:
+3-element SparseVector{Bool, Int64} with 3 stored entries:
   [1]  =  1
   [2]  =  0
   [3]  =  1
@@ -262,7 +262,7 @@ the dictionary, and the nonzero values are the values from the dictionary.
 # Examples
 ```jldoctest
 julia> sparsevec(Dict(1 => 3, 2 => 2))
-2-element SparseVector{Int64,Int64} with 2 stored entries:
+2-element SparseVector{Int64, Int64} with 2 stored entries:
   [1]  =  3
   [2]  =  2
 ```
@@ -340,16 +340,16 @@ Drop entry `x[i]` from `x` if `x[i]` is stored and otherwise do nothing.
 # Examples
 ```jldoctest
 julia> x = sparsevec([1, 3], [1.0, 2.0])
-3-element SparseVector{Float64,Int64} with 2 stored entries:
+3-element SparseVector{Float64, Int64} with 2 stored entries:
   [1]  =  1.0
   [3]  =  2.0
 
 julia> SparseArrays.dropstored!(x, 3)
-3-element SparseVector{Float64,Int64} with 1 stored entry:
+3-element SparseVector{Float64, Int64} with 1 stored entry:
   [1]  =  1.0
 
 julia> SparseArrays.dropstored!(x, 2)
-3-element SparseVector{Float64,Int64} with 1 stored entry:
+3-element SparseVector{Float64, Int64} with 1 stored entry:
   [1]  =  1.0
 ```
 """
@@ -391,7 +391,7 @@ Convert a vector `A` into a sparse vector of length `m`.
 # Examples
 ```jldoctest
 julia> sparsevec([1.0, 2.0, 0.0, 0.0, 3.0, 0.0])
-6-element SparseVector{Float64,Int64} with 3 stored entries:
+6-element SparseVector{Float64, Int64} with 3 stored entries:
   [1]  =  1.0
   [2]  =  2.0
   [5]  =  3.0
@@ -405,15 +405,14 @@ sparse(a::AbstractVector) = sparsevec(a)
 
 function _dense2indval!(nzind::Vector{Ti}, nzval::Vector{Tv}, s::AbstractArray{Tv}) where {Tv,Ti}
     require_one_based_indexing(s)
-    cap = length(nzind);
+    cap = length(nzind)
     @assert cap == length(nzval)
     n = length(s)
     c = 0
-    @inbounds for i = 1:n
-        v = s[i]
+    @inbounds for (i, v) in enumerate(s)
         if !iszero(v)
             if c >= cap
-                cap *= 2
+                cap = (cap == 0) ? 1 : 2*cap
                 resize!(nzind, cap)
                 resize!(nzval, cap)
             end
@@ -761,7 +760,7 @@ values in sparse vector `x` and `V` is a vector of the values.
 # Examples
 ```jldoctest
 julia> x = sparsevec([1 2 0; 0 0 3; 0 4 0])
-9-element SparseVector{Int64,Int64} with 4 stored entries:
+9-element SparseVector{Int64, Int64} with 4 stored entries:
   [1]  =  1
   [4]  =  2
   [6]  =  4
@@ -1355,34 +1354,50 @@ end
 
 ### Reduction
 
+function _sum(f, x::AbstractSparseVector)
+    n = length(x)
+    n > 0 || return sum(f, nonzeros(x)) # return zero() of proper type
+    m = nnz(x)
+    (m == 0 ? n * f(zero(eltype(x))) :
+     m == n ? sum(f, nonzeros(x)) :
+     Base.add_sum((n - m) * f(zero(eltype(x))), sum(f, nonzeros(x))))
+end
+
+sum(f::Union{Function, Type}, x::AbstractSparseVector) = _sum(f, x) # resolve ambiguity
+sum(f, x::AbstractSparseVector) = _sum(f, x)
 sum(x::AbstractSparseVector) = sum(nonzeros(x))
 
-function maximum(x::AbstractSparseVector{T}) where T<:Real
+function _maximum(f, x::AbstractSparseVector)
     n = length(x)
-    n > 0 || throw(ArgumentError("maximum over empty array is not allowed."))
-    m = nnz(x)
-    (m == 0 ? zero(T) :
-     m == n ? maximum(nonzeros(x)) :
-     max(zero(T), maximum(nonzeros(x))))::T
-end
-
-function minimum(x::AbstractSparseVector{T}) where T<:Real
-    n = length(x)
-    n > 0 || throw(ArgumentError("minimum over empty array is not allowed."))
-    m = nnz(x)
-    (m == 0 ? zero(T) :
-     m == n ? minimum(nonzeros(x)) :
-     min(zero(T), minimum(nonzeros(x))))::T
-end
-
-for f in [:sum, :maximum, :minimum], op in [:abs, :abs2]
-    SV = :AbstractSparseVector
-    if f === :minimum
-        @eval ($f)(::typeof($op), x::$SV{T}) where {T<:Number} = nnz(x) < length(x) ? ($op)(zero(T)) : ($f)($op, nonzeros(x))
-    else
-        @eval ($f)(::typeof($op), x::$SV) = ($f)($op, nonzeros(x))
+    if n == 0
+        if f === abs || f === abs2
+            return zero(eltype(x)) # preserving maximum(abs/abs2, x) behaviour in 1.0.x
+        else
+            throw(ArgumentError("maximum over an empty array is not allowed."))
+        end
     end
+    m = nnz(x)
+    (m == 0 ? f(zero(eltype(x))) :
+     m == n ? maximum(f, nonzeros(x)) :
+     max(f(zero(eltype(x))), maximum(f, nonzeros(x))))
 end
+
+maximum(f::Union{Function, Type}, x::AbstractSparseVector) = _maximum(f, x) # resolve ambiguity
+maximum(f, x::AbstractSparseVector) = _maximum(f, x)
+maximum(x::AbstractSparseVector) = maximum(identity, x)
+
+function _minimum(f, x::AbstractSparseVector)
+    n = length(x)
+    n > 0 || throw(ArgumentError("minimum over an empty array is not allowed."))
+    m = nnz(x)
+    (m == 0 ? f(zero(eltype(x))) :
+     m == n ? minimum(f, nonzeros(x)) :
+     min(f(zero(eltype(x))), minimum(f, nonzeros(x))))
+end
+
+minimum(f::Union{Function, Type}, x::AbstractSparseVector) = _minimum(f, x) # resolve ambiguity
+minimum(f, x::AbstractSparseVector) = _minimum(f, x)
+minimum(x::AbstractSparseVector) = minimum(identity, x)
 
 norm(x::SparseVectorUnion, p::Real=2) = norm(nonzeros(x), p)
 
@@ -1674,10 +1689,8 @@ function densemv(A::AbstractSparseMatrixCSC, x::AbstractSparseVector; trans::Abs
         mul!(y, A, x)
     elseif trans == 'T' || trans == 't'
         mul!(y, transpose(A), x)
-    elseif trans == 'C' || trans == 'c'
+    else # trans == 'C' || trans == 'c'
         mul!(y, adjoint(A), x)
-    else
-        throw(ArgumentError("Invalid trans character $trans"))
     end
     y
 end
@@ -1819,85 +1832,74 @@ for isunittri in (true, false), islowertri in (true, false)
     tritype = :(LinearAlgebra.$(Symbol(unitstr, halfstr, "Triangular")))
 
     # build out-of-place left-division operations
+    # broad method where elements are Numbers
+    @eval function \(A::$tritype{<:TA,<:AbstractMatrix}, b::SparseVector{Tb}) where {TA<:Number,Tb<:Number}
+        TAb = $(isunittri ?
+            :(typeof(zero(TA)*zero(Tb) + zero(TA)*zero(Tb))) :
+            :(typeof((zero(TA)*zero(Tb) + zero(TA)*zero(Tb))/one(TA))) )
+        LinearAlgebra.ldiv!(convert(AbstractArray{TAb}, A), convert(Array{TAb}, b))
+    end
+    # fallback where elements are not Numbers
+    @eval function \(A::$tritype, b::SparseVector)
+        LinearAlgebra.ldiv!(A, copy(b))
+    end
+
+    # faster method requiring good view support of the
+    # triangular matrix type. hence the StridedMatrix restriction.
     for (istrans, applyxform, xformtype, xformop) in (
             (false, false, :identity,  :identity),
             (true,  true,  :Transpose, :transpose),
             (true,  true,  :Adjoint,   :adjoint) )
 
-        # broad method where elements are Numbers
-        xformtritype = applyxform ? :($xformtype{<:TA,<:$tritype{<:Any,<:AbstractMatrix}}) :
-                                    :($tritype{<:TA,<:AbstractMatrix})
-        @eval function \(xformA::$xformtritype, b::SparseVector{Tb}) where {TA<:Number,Tb<:Number}
-            A = $(applyxform ? :(xformA.parent) : :(xformA) )
-            TAb = $(isunittri ?
-                :(typeof(zero(TA)*zero(Tb) + zero(TA)*zero(Tb))) :
-                :(typeof((zero(TA)*zero(Tb) + zero(TA)*zero(Tb))/one(TA))) )
-            LinearAlgebra.ldiv!($xformop(convert(AbstractArray{TAb}, A)), convert(Array{TAb}, b))
-        end
-
-        # faster method requiring good view support of the
-        # triangular matrix type. hence the StridedMatrix restriction.
-        xformtritype = applyxform ? :($xformtype{<:TA,<:$tritype{<:Any,<:StridedMatrix}}) :
+        xformtritype = applyxform ? :($tritype{<:TA,<:$xformtype{<:Any,<:StridedMatrix}}) :
                                     :($tritype{<:TA,<:StridedMatrix})
-        @eval function \(xformA::$xformtritype, b::SparseVector{Tb}) where {TA<:Number,Tb<:Number}
-            A = $(applyxform ? :(xformA.parent) : :(xformA) )
-            TAb = $(isunittri ?
+        @eval function \(xA::$xformtritype, b::SparseVector{Tb}) where {TA<:Number,Tb<:Number}
+            TAb = $( isunittri ?
                 :(typeof(zero(TA)*zero(Tb) + zero(TA)*zero(Tb))) :
                 :(typeof((zero(TA)*zero(Tb) + zero(TA)*zero(Tb))/one(TA))) )
             r = convert(Array{TAb}, b)
             # If b has no nonzero entries, then r is necessarily zero. If b has nonzero
             # entries, then the operation involves only b[nzrange], so we extract and
             # operate on solely b[nzrange] for efficiency.
+            A = $( applyxform ? :(parent(parent(xA))) : :(parent(xA)) )
             if nnz(b) != 0
-                nzrange = $( (islowertri && !istrans) || (!islowertri && istrans) ?
+                nzrange = $( islowertri ?
                     :(nonzeroinds(b)[1]:length(b::SparseVector)) :
                     :(1:nonzeroinds(b)[end]) )
                 nzrangeviewr = view(r, nzrange)
-                nzrangeviewA = $tritype(view(A.data, nzrange, nzrange))
-                LinearAlgebra.ldiv!($xformop(convert(AbstractArray{TAb}, nzrangeviewA)), nzrangeviewr)
+                nzrangeviewA = $tritype($xformop(view(A, nzrange, nzrange)))
+                LinearAlgebra.ldiv!(convert(AbstractArray{TAb}, nzrangeviewA), nzrangeviewr)
             end
             r
         end
 
-        # fallback where elements are not Numbers
-        xformtritype = applyxform ? :($xformtype{<:Any,<:$tritype}) : :($tritype)
-        @eval function \(xformA::$xformtritype, b::SparseVector)
-            A = $(applyxform ? :(xformA.parent) : :(xformA) )
-            LinearAlgebra.ldiv!($xformop(A), copy(b))
-        end
-    end
-
-    # build in-place left-division operations
-    for (istrans, applyxform, xformtype, xformop) in (
-            (false, false, :identity,  :identity),
-            (true,  true,  :Transpose, :transpose),
-            (true,  true,  :Adjoint,   :adjoint) )
-        xformtritype = applyxform ? :($xformtype{<:Any,<:$tritype{<:Any,<:StridedMatrix}}) :
+        # build in-place left-division operations
+        xformtritype = applyxform ? :($tritype{<:Any,<:$xformtype{<:Any,<:StridedMatrix}}) :
                                     :($tritype{<:Any,<:StridedMatrix})
 
         # the generic in-place left-division methods handle these cases, but
         # we can achieve greater efficiency where the triangular matrix provides
-        # good view support. hence the StridedMatrix restriction.
-        @eval function ldiv!(xformA::$xformtritype, b::SparseVector)
-            A = $(applyxform ? :(xformA.parent) : :(xformA) )
+        # good view support, hence the StridedMatrix restriction.
+        @eval function ldiv!(xA::$xformtritype, b::SparseVector)
+            A = $( applyxform ? :(parent(parent(xA))) : :(parent(xA)) )
             # If b has no nonzero entries, the result is necessarily zero and this call
             # reduces to a no-op. If b has nonzero entries, then...
             if nnz(b) != 0
                 # densify the relevant part of b in one shot rather
                 # than potentially repeatedly reallocating during the solve
-                $( (islowertri && !istrans) || (!islowertri && istrans) ?
+                $( islowertri ?
                     :(_densifyfirstnztoend!(b)) :
                     :(_densifystarttolastnz!(b)) )
                 # this operation involves only the densified section, so
                 # for efficiency we extract and operate on solely that section
                 # furthermore we operate on that section as a dense vector
                 # such that dispatch has a chance to exploit, e.g., tuned BLAS
-                nzrange = $( (islowertri && !istrans) || (!islowertri && istrans) ?
-                    :(nonzeroinds(b)[1]:length(b::SparseVector)) :
+                nzrange = $( islowertri ?
+                    :(nonzeroinds(b)[1]:length(b)) :
                     :(1:nonzeroinds(b)[end]) )
                 nzrangeviewbnz = view(nonzeros(b), nzrange .- (nonzeroinds(b)[1] - 1))
-                nzrangeviewA = $tritype(view(A.data, nzrange, nzrange))
-                LinearAlgebra.ldiv!($xformop(nzrangeviewA), nzrangeviewbnz)
+                nzrangeviewA = $tritype($xformop(view(A, nzrange, nzrange)))
+                LinearAlgebra.ldiv!(nzrangeviewA, nzrangeviewbnz)
             end
             b
         end
@@ -2018,13 +2020,13 @@ For an in-place version and algorithmic information, see [`dropzeros!`](@ref).
 # Examples
 ```jldoctest
 julia> A = sparsevec([1, 2, 3], [1.0, 0.0, 1.0])
-3-element SparseVector{Float64,Int64} with 3 stored entries:
+3-element SparseVector{Float64, Int64} with 3 stored entries:
   [1]  =  1.0
   [2]  =  0.0
   [3]  =  1.0
 
 julia> dropzeros(A)
-3-element SparseVector{Float64,Int64} with 2 stored entries:
+3-element SparseVector{Float64, Int64} with 2 stored entries:
   [1]  =  1.0
   [3]  =  1.0
 ```

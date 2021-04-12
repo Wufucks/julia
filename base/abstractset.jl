@@ -64,10 +64,10 @@ julia> union!(a, 1:2:8);
 
 julia> a
 Set{Int64} with 5 elements:
-  7
-  4
-  3
   5
+  4
+  7
+  3
   1
 ```
 """
@@ -86,7 +86,7 @@ max_values(::Type{Bool}) = 2
 max_values(::Type{Nothing}) = 1
 
 function union!(s::AbstractSet{T}, itr) where T
-    haslength(itr) && sizehint!(s, length(s) + length(itr))
+    haslength(itr) && sizehint!(s, length(s) + Int(length(itr))::Int)
     for x in itr
         push!(s, x)
         length(s) == max_values(T) && break
@@ -246,6 +246,8 @@ function ⊇ end
 
 Determine whether every element of `a` is also in `b`, using [`in`](@ref).
 
+See also [`⊊`](@ref), [`⊈`](@ref).
+
 # Examples
 ```jldoctest
 julia> issubset([1, 2], [1, 2, 3])
@@ -306,6 +308,8 @@ function ⊋ end
 
 Determines if `a` is a subset of, but not equal to, `b`.
 
+See also [`issubset`](@ref) (`⊆`), [`⊈`](@ref).
+
 # Examples
 ```jldoctest
 julia> (1, 2) ⊊ (1, 2, 3)
@@ -328,6 +332,8 @@ function ⊉ end
     ⊉(b, a) -> Bool
 
 Negation of `⊆` and `⊇`, i.e. checks that `a` is not a subset of `b`.
+
+See also [`issubset`](@ref) (`⊆`), [`⊊`](@ref).
 
 # Examples
 ```jldoctest

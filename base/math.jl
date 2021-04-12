@@ -97,6 +97,15 @@ function clamp!(x::AbstractArray, lo, hi)
     x
 end
 
+"""
+    clamp(x::Integer, r::AbstractUnitRange)
+
+Clamp `x` to lie within range `r`.
+
+!!! compat "Julia 1.6"
+     This method requires at least Julia 1.6.
+"""
+clamp(x::Integer, r::AbstractUnitRange{<:Integer}) = clamp(x, first(r), last(r))
 
 """
     evalpoly(x, p)
@@ -121,7 +130,7 @@ julia> evalpoly(2, (1, 2, 3))
 """
 function evalpoly(x, p::Tuple)
     if @generated
-        N = length(p.parameters)
+        N = length(p.parameters::Core.SimpleVector)
         ex = :(p[end])
         for i in N-1:-1:1
             ex = :(muladd(x, $ex, p[$i]))
@@ -230,6 +239,20 @@ julia> @evalpoly(2, 1, 1, 1)
 macro evalpoly(z, p...)
     zesc, pesc = esc(z), esc.(p)
     :(evalpoly($zesc, ($(pesc...),)))
+end
+
+# polynomial evaluation using compensated summation.
+# much more accurate, especially when lo can be combined with other rounding errors
+@inline function exthorner(x, p::Tuple)
+    hi, lo = p[end], zero(x)
+    for i in length(p)-1:-1:1
+        pi = p[i]
+        prod = hi*x
+        err = fma(hi, x, -prod)
+        hi = pi+prod
+        lo = fma(lo, x, prod - (hi - pi) + err)
+    end
+    return hi, lo
 end
 
 """
@@ -356,64 +379,6 @@ Compute the inverse hyperbolic sine of `x`.
 """
 asinh(x::Number)
 
-"""
-    expm1(x)
-
-Accurately compute ``e^x-1``.
-"""
-expm1(x)
-for f in (:exp2, :expm1)
-    @eval begin
-        ($f)(x::Float64) = ccall(($(string(f)),libm), Float64, (Float64,), x)
-        ($f)(x::Float32) = ccall(($(string(f,"f")),libm), Float32, (Float32,), x)
-        ($f)(x::Real) = ($f)(float(x))
-    end
-end
-
-"""
-    exp2(x)
-
-Compute the base 2 exponential of `x`, in other words ``2^x``.
-
-# Examples
-```jldoctest
-julia> exp2(5)
-32.0
-```
-"""
-exp2(x::AbstractFloat) = 2^x
-
-"""
-    exp10(x)
-
-Compute the base 10 exponential of `x`, in other words ``10^x``.
-
-# Examples
-```jldoctest
-julia> exp10(2)
-100.0
-```
-"""
-exp10(x::AbstractFloat) = 10^x
-
-for f in (:sinh, :cosh, :tanh, :atan, :asinh, :exp, :expm1)
-    @eval ($f)(x::AbstractFloat) = error("not implemented for ", typeof(x))
-end
-
-# functions with special cases for integer arguments
-@inline function exp2(x::Base.BitInteger)
-    if x > 1023
-        Inf64
-    elseif x <= -1023
-        # if -1073 < x <= -1023 then Result will be a subnormal number
-        # Hex literal with padding must be used to work on 32bit machine
-        reinterpret(Float64, 0x0000_0000_0000_0001 << ((x + 1074) % UInt))
-    else
-        # We will cast everything to Int64 to avoid errors in case of Int128
-        # If x is a Int128, and is outside the range of Int64, then it is not -1023<x<=1023
-        reinterpret(Float64, (exponent_bias(Float64) + (x % Int64)) << (significand_bits(Float64) % UInt))
-    end
-end
 
 # utility for converting NaN return to DomainError
 # the branch in nan_dom_err prevents its callers from inlining, so be sure to force it
@@ -507,9 +472,9 @@ julia> log2(10)
 
 julia> log2(-2)
 ERROR: DomainError with -2.0:
-NaN result for non-NaN input.
+log2 will only return a complex result if called with a complex argument. Try log2(Complex(x)).
 Stacktrace:
- [1] nan_dom_err at ./math.jl:325 [inlined]
+ [1] throw_complex_domainerror(f::Symbol, x::Float64) at ./math.jl:31
 [...]
 ```
 """
@@ -531,9 +496,9 @@ julia> log10(2)
 
 julia> log10(-2)
 ERROR: DomainError with -2.0:
-NaN result for non-NaN input.
+log10 will only return a complex result if called with a complex argument. Try log10(Complex(x)).
 Stacktrace:
- [1] nan_dom_err at ./math.jl:325 [inlined]
+ [1] throw_complex_domainerror(f::Symbol, x::Float64) at ./math.jl:31
 [...]
 ```
 """
@@ -562,13 +527,6 @@ Stacktrace:
 ```
 """
 log1p(x)
-for f in (:log2, :log10)
-    @eval begin
-        @inline ($f)(x::Float64) = nan_dom_err(ccall(($(string(f)), libm), Float64, (Float64,), x), x)
-        @inline ($f)(x::Float32) = nan_dom_err(ccall(($(string(f, "f")), libm), Float32, (Float32,), x), x)
-        @inline ($f)(x::Real) = ($f)(float(x))
-    end
-end
 
 @inline function sqrt(x::Union{Float32,Float64})
     x < zero(x) && throw_complex_domainerror(:sqrt, x)
@@ -597,7 +555,7 @@ julia> sqrt(big(complex(-81)))
 0.0 + 9.0im
 ```
 """
-sqrt(x::Real) = sqrt(float(x))
+sqrt(x)
 
 """
     hypot(x, y)
@@ -609,6 +567,10 @@ An Improved Algorithm for `hypot(a,b)`
 by Carlos F. Borges
 The article is available online at ArXiv at the link
   https://arxiv.org/abs/1904.09481
+
+    hypot(x...)
+
+Compute the hypotenuse ``\\sqrt{\\sum |x_i|^2}`` avoiding overflow and underflow.
 
 # Examples
 ```jldoctest; filter = r"Stacktrace:(\\n \\[[0-9]+\\].*)*"
@@ -625,77 +587,7 @@ Stacktrace:
 
 julia> hypot(3, 4im)
 5.0
-```
-"""
-hypot(x::Number, y::Number) = hypot(promote(x, y)...)
-hypot(x::Complex, y::Complex) = hypot(abs(x), abs(y))
-hypot(x::T, y::T) where {T<:Real} = hypot(float(x), float(y))
-function hypot(x::T, y::T) where {T<:Number}
-    if !iszero(x)
-        z = y/x
-        z2 = z*z
 
-        abs(x) * sqrt(oneunit(z2) + z2)
-    else
-        abs(y)
-    end
-end
-
-function hypot(x::T, y::T) where T<:AbstractFloat
-    # Return Inf if either or both inputs is Inf (Compliance with IEEE754)
-    if isinf(x) || isinf(y)
-        return T(Inf)
-    end
-
-    # Order the operands
-    ax,ay = abs(x), abs(y)
-    if ay > ax
-        ax,ay = ay,ax
-    end
-
-    # Widely varying operands
-    if ay <= ax*sqrt(eps(T)/2)  #Note: This also gets ay == 0
-        return ax
-    end
-
-    # Operands do not vary widely
-    scale = eps(sqrt(floatmin(T)))  #Rescaling constant
-    if ax > sqrt(floatmax(T)/2)
-        ax = ax*scale
-        ay = ay*scale
-        scale = inv(scale)
-    elseif ay < sqrt(floatmin(T))
-        ax = ax/scale
-        ay = ay/scale
-    else
-        scale = one(scale)
-    end
-    h = sqrt(muladd(ax,ax,ay*ay))
-    # This branch is correctly rounded but requires a native hardware fma.
-    if Base.Math.FMA_NATIVE
-        hsquared = h*h
-        axsquared = ax*ax
-        h -= (fma(-ay,ay,hsquared-axsquared) + fma(h,h,-hsquared) - fma(ax,ax,-axsquared))/(2*h)
-    # This branch is within one ulp of correctly rounded.
-    else
-        if h <= 2*ay
-            delta = h-ay
-            h -= muladd(delta,delta-2*(ax-ay),ax*(2*delta - ax))/(2*h)
-        else
-            delta = h-ax
-            h -= muladd(delta,delta,muladd(ay,(4*delta-ay),2*delta*(ax-2*ay)))/(2*h)
-        end
-    end
-    return h*scale
-end
-
-"""
-    hypot(x...)
-
-Compute the hypotenuse ``\\sqrt{\\sum |x_i|^2}`` avoiding overflow and underflow.
-
-# Examples
-```jldoctest
 julia> hypot(-5.7)
 5.7
 
@@ -703,7 +595,76 @@ julia> hypot(3, 4im, 12.0)
 13.0
 ```
 """
-hypot(x::Number...) = sqrt(sum(abs2(y) for y in x))
+hypot(x::Number) = abs(float(x))
+hypot(x::Number, y::Number, xs::Number...) = _hypot(float.(promote(x, y, xs...))...)
+function _hypot(x, y)
+    # preserves unit
+    axu = abs(x)
+    ayu = abs(y)
+
+    # unitless
+    ax = axu / oneunit(axu)
+    ay = ayu / oneunit(ayu)
+
+    # Return Inf if either or both inputs is Inf (Compliance with IEEE754)
+    if isinf(ax) || isinf(ay)
+        return oftype(axu, Inf)
+    end
+
+    # Order the operands
+    if ay > ax
+        axu, ayu = ayu, axu
+        ax, ay = ay, ax
+    end
+
+    # Widely varying operands
+    if ay <= ax*sqrt(eps(typeof(ax))/2)  #Note: This also gets ay == 0
+        return axu
+    end
+
+    # Operands do not vary widely
+    scale = eps(typeof(ax))*sqrt(floatmin(ax))  #Rescaling constant
+    if ax > sqrt(floatmax(ax)/2)
+        ax = ax*scale
+        ay = ay*scale
+        scale = inv(scale)
+    elseif ay < sqrt(floatmin(ax))
+        ax = ax/scale
+        ay = ay/scale
+    else
+        scale = oneunit(scale)
+    end
+    h = sqrt(muladd(ax, ax, ay*ay))
+    # This branch is correctly rounded but requires a native hardware fma.
+    if Base.Math.FMA_NATIVE
+        hsquared = h*h
+        axsquared = ax*ax
+        h -= (fma(-ay, ay, hsquared-axsquared) + fma(h, h,-hsquared) - fma(ax, ax, -axsquared))/(2*h)
+    # This branch is within one ulp of correctly rounded.
+    else
+        if h <= 2*ay
+            delta = h-ay
+            h -= muladd(delta, delta-2*(ax-ay), ax*(2*delta - ax))/(2*h)
+        else
+            delta = h-ax
+            h -= muladd(delta, delta, muladd(ay, (4*delta - ay), 2*delta*(ax - 2*ay)))/(2*h)
+        end
+    end
+    return h*scale*oneunit(axu)
+end
+_hypot(x::Float16, y::Float16) = Float16(_hypot(Float32(x), Float32(y)))
+_hypot(x::ComplexF16, y::ComplexF16) = Float16(_hypot(ComplexF32(x), ComplexF32(y)))
+
+function _hypot(x...)
+    maxabs = maximum(abs, x)
+    if isnan(maxabs) && any(isinf, x)
+        return oftype(maxabs, Inf)
+    elseif (iszero(maxabs) || isinf(maxabs))
+        return maxabs
+    else
+        return maxabs * sqrt(sum(y -> abs2(y / maxabs), x))
+    end
+end
 
 atan(y::Real, x::Real) = atan(promote(float(y),float(x))...)
 atan(y::T, x::T) where {T<:AbstractFloat} = Base.no_op_err("atan", T)
@@ -780,6 +741,15 @@ ldexp(x::Float16, q::Integer) = Float16(ldexp(Float32(x), q))
 
 Get the exponent of a normalized floating-point number.
 Returns the largest integer `y` such that `2^y ≤ abs(x)`.
+
+# Examples
+```jldoctest
+julia> exponent(6.5)
+2
+
+julia> exponent(16.0)
+4
+```
 """
 function exponent(x::T) where T<:IEEEFloat
     @noinline throw1(x) = throw(DomainError(x, "Cannot be NaN or Inf."))
@@ -830,6 +800,11 @@ end
 
 Return `(x,exp)` such that `x` has a magnitude in the interval ``[1/2, 1)`` or 0,
 and `val` is equal to ``x \\times 2^{exp}``.
+# Examples
+```jldoctest
+julia> frexp(12.8)
+(0.8, 4)
+```
 """
 function frexp(x::T) where T<:IEEEFloat
     xu = reinterpret(Unsigned, x)
@@ -898,6 +873,8 @@ end
     end
     z
 end
+@inline ^(x::Float16, y::Float16) = Float16(Float32(x)^Float32(y))  # TODO: optimize
+
 @inline function ^(x::Float64, y::Integer)
     y == -1 && return inv(x)
     y == 0 && return one(x)
@@ -1138,24 +1115,6 @@ julia> 3 * 2 + 1
 """
 muladd(x,y,z) = x*y+z
 
-# Float16 definitions
-
-for func in (:sin,:cos,:tan,:asin,:acos,:atan,:sinh,:cosh,:tanh,:asinh,:acosh,
-             :atanh,:exp,:exp2,:exp10,:log,:log2,:log10,:sqrt,:lgamma,:log1p)
-    @eval begin
-        $func(a::Float16) = Float16($func(Float32(a)))
-        $func(a::ComplexF16) = ComplexF16($func(ComplexF32(a)))
-    end
-end
-
-for func in (:atan,:hypot)
-    @eval begin
-        $func(a::Float16,b::Float16) = Float16($func(Float32(a),Float32(b)))
-    end
-end
-
-cbrt(a::Float16) = Float16(cbrt(Float32(a)))
-sincos(a::Float16) = Float16.(sincos(Float32(a)))
 
 # helper functions for Libm functionality
 
@@ -1184,20 +1143,45 @@ Return positive part of the high word of `x` as a `UInt32`.
 # More special functions
 include("special/cbrt.jl")
 include("special/exp.jl")
-include("special/exp10.jl")
-include("special/ldexp_exp.jl")
 include("special/hyperbolic.jl")
 include("special/trig.jl")
 include("special/rem_pio2.jl")
 include("special/log.jl")
 
-# `missing` definitions for functions in this module
-for f in (:(acos), :(acosh), :(asin), :(asinh), :(atan), :(atanh),
-          :(sin), :(sinh), :(cos), :(cosh), :(tan), :(tanh),
-          :(exp), :(exp2), :(expm1), :(log), :(log10), :(log1p),
-          :(log2), :(exponent), :(sqrt))
+
+# Float16 definitions
+
+for func in (:sin,:cos,:tan,:asin,:acos,:atan,:sinh,:cosh,:tanh,:asinh,:acosh,
+             :atanh,:log,:log2,:log10,:sqrt,:lgamma,:log1p)
+    @eval begin
+        $func(a::Float16) = Float16($func(Float32(a)))
+        $func(a::ComplexF16) = ComplexF16($func(ComplexF32(a)))
+    end
+end
+
+for func in (:exp,:exp2,:exp10)
+     @eval $func(a::ComplexF16) = ComplexF16($func(ComplexF32(a)))
+end
+
+
+atan(a::Float16,b::Float16) = Float16(atan(Float32(a),Float32(b)))
+cbrt(a::Float16) = Float16(cbrt(Float32(a)))
+sincos(a::Float16) = Float16.(sincos(Float32(a)))
+
+for f in (:sin, :cos, :tan, :asin, :atan, :acos,
+          :sinh, :cosh, :tanh, :asinh, :acosh, :atanh,
+          :exp, :exp2, :exp10, :expm1, :log, :log2, :log10, :log1p,
+          :exponent, :sqrt, :cbrt)
+    @eval function ($f)(x::Real)
+        xf = float(x)
+        x === xf && throw(MethodError($f, (x,)))
+        return ($f)(xf)
+    end
     @eval $(f)(::Missing) = missing
 end
+
+exp2(x::AbstractFloat) = 2^x
+exp10(x::AbstractFloat) = 10^x
 clamp(::Missing, lo, hi) = missing
 
 end # module

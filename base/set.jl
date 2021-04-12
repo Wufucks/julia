@@ -166,6 +166,8 @@ _unique_from(itr, out, seen, i) = unique_from(itr, out, seen, i)
     return out
 end
 
+unique(r::AbstractRange) = allunique(r) ? r : oftype(r, r[begin:begin])
+
 """
     unique(f, itr)
 
@@ -262,7 +264,7 @@ function unique!(f, A::AbstractVector; seen::Union{Nothing,Set}=nothing)
         return A
     end
 
-    i = firstindex(A)
+    i = firstindex(A)::Int
     x = @inbounds A[i]
     y = f(x)
     if seen === nothing
@@ -289,7 +291,7 @@ function _unique!(f, A::AbstractVector, seen::Set, current::Integer, i::Integer)
         end
         i += 1
     end
-    return resize!(A, current - firstindex(A) + 1)::typeof(A)
+    return resize!(A, current - firstindex(A)::Int + 1)::typeof(A)
 end
 
 
@@ -306,10 +308,12 @@ function _groupedunique!(A::AbstractVector)
     idxs = eachindex(A)
     y = first(A)
     # We always keep the first element
-    it = iterate(idxs, iterate(idxs)[2])
+    T = NTuple{2,Any} # just to eliminate `iterate(idxs)::Nothing` candidate
+    it = iterate(idxs, (iterate(idxs)::T)[2])
     count = 1
     for x in Iterators.drop(A, 1)
         if !isequal(x, y)
+            it = it::T
             y = A[it[1]] = x
             count += 1
             it = iterate(idxs, it[2])
@@ -380,22 +384,31 @@ false
 ```
 """
 function allunique(C)
-    seen = Set{eltype(C)}()
-    for x in C
-        if in(x, seen)
-            return false
-        else
-            push!(seen, x)
+    seen = Dict{eltype(C), Nothing}()
+    x = iterate(C)
+    if haslength(C) && length(C) > 1000
+        for i in OneTo(1000)
+            v, s = x
+            idx = ht_keyindex2!(seen, v)
+            idx > 0 && return false
+            _setindex!(seen, nothing, v, -idx)
+            x = iterate(C, s)
         end
+        sizehint!(seen, length(C))
     end
-    true
+    while x !== nothing
+        v, s = x
+        idx = ht_keyindex2!(seen, v)
+        idx > 0 && return false
+        _setindex!(seen, nothing, v, -idx)
+        x = iterate(C, s)
+    end
+    return true
 end
 
 allunique(::Union{AbstractSet,AbstractDict}) = true
 
-allunique(r::AbstractRange{T}) where {T} = (step(r) != zero(T)) || (length(r) <= 1)
-allunique(r::StepRange{T,S}) where {T,S} = (step(r) != zero(S)) || (length(r) <= 1)
-allunique(r::StepRangeLen{T,R,S}) where {T,R,S} = (step(r) != zero(S)) || (length(r) <= 1)
+allunique(r::AbstractRange) = !iszero(step(r)) || length(r) <= 1
 
 filter!(f, s::Set) = unsafe_filter!(f, s)
 
@@ -422,7 +435,7 @@ end
 # TODO: use copy!, which is currently unavailable from here since it is defined in Future
 _copy_oftype(x, ::Type{T}) where {T} = copyto!(similar(x, T), x)
 # TODO: use similar() once deprecation is removed and it preserves keys
-_copy_oftype(x::AbstractDict, ::Type{T}) where {T} = merge!(empty(x, T), x)
+_copy_oftype(x::AbstractDict, ::Type{Pair{K,V}}) where {K,V} = merge!(empty(x, K, V), x)
 _copy_oftype(x::AbstractSet, ::Type{T}) where {T} = union!(empty(x, T), x)
 
 _copy_oftype(x::AbstractArray{T}, ::Type{T}) where {T} = copy(x)
@@ -496,7 +509,7 @@ julia> replace!(x -> isodd(x) ? 2x : x, [1, 2, 3, 4])
 julia> replace!(Dict(1=>2, 3=>4)) do kv
            first(kv) < 3 ? first(kv)=>3 : kv
        end
-Dict{Int64,Int64} with 2 entries:
+Dict{Int64, Int64} with 2 entries:
   3 => 4
   1 => 3
 
@@ -559,7 +572,7 @@ promote_valuetype(x::Pair{K, V}, y::Pair...) where {K, V} =
 # Subtract singleton types which are going to be replaced
 function subtract_singletontype(::Type{T}, x::Pair{K}) where {T, K}
     if issingletontype(K)
-        Core.Compiler.typesubtract(T, K)
+        typesplit(T, K)
     else
         T
     end
@@ -586,7 +599,7 @@ julia> replace(x -> isodd(x) ? 2x : x, [1, 2, 3, 4])
 julia> replace(Dict(1=>2, 3=>4)) do kv
            first(kv) < 3 ? first(kv)=>3 : kv
        end
-Dict{Int64,Int64} with 2 entries:
+Dict{Int64, Int64} with 2 entries:
   3 => 4
   1 => 3
 ```
@@ -606,8 +619,10 @@ replace(a::AbstractString, b::Pair, c::Pair) = throw(MethodError(replace, (a, b,
 askey(k, ::AbstractDict) = k.first
 askey(k, ::AbstractSet) = k
 
-function _replace!(new::Callable, res::T, A::T,
-                   count::Int) where T<:Union{AbstractDict,AbstractSet}
+function _replace!(new::Callable, res::Union{AbstractDict,AbstractSet},
+                   A::Union{AbstractDict,AbstractSet}, count::Int)
+    @assert res isa AbstractDict && A isa AbstractDict ||
+        res isa AbstractSet && A isa AbstractSet
     count == 0 && return res
     c = 0
     if res === A # cannot replace elements while iterating over A
@@ -672,3 +687,73 @@ function _replace!(new::Callable, res::AbstractArray, A::AbstractArray, count::I
     end
     res
 end
+
+### specialization for Dict / Set
+
+function _replace!(new::Callable, t::Dict{K,V}, A::AbstractDict, count::Int) where {K,V}
+    # we ignore A, which is supposed to be equal to the destination t,
+    # as it can generally be faster to just replace inline
+    count == 0 && return t
+    c = 0
+    news = Pair{K,V}[]
+    i = skip_deleted_floor!(t)
+    @inbounds while i != 0
+        k1, v1 = t.keys[i], t.vals[i]
+        x1 = Pair{K,V}(k1, v1)
+        x2 = new(x1)
+        if x1 !== x2
+            k2, v2 = first(x2), last(x2)
+            if isequal(k1, k2)
+                t.keys[i] = k2
+                t.vals[i] = v2
+                t.age += 1
+            else
+                _delete!(t, i)
+                push!(news, x2)
+            end
+            c += 1
+            c == count && break
+        end
+        i = i == typemax(Int) ? 0 : skip_deleted(t, i+1)
+    end
+    for n in news
+        push!(t, n)
+    end
+    t
+end
+
+function _replace!(new::Callable, t::Set{T}, ::AbstractSet, count::Int) where {T}
+    _replace!(t.dict, t.dict, count) do kv
+        k = first(kv)
+        k2 = new(k)
+        k2 === k ? kv : k2 => nothing
+    end
+    t
+end
+
+### replace for tuples
+
+function _replace(f::Callable, t::Tuple, count::Int)
+    if count == 0 || isempty(t)
+        t
+    else
+        x = f(t[1])
+        (x, _replace(f, tail(t), count - !==(x, t[1]))...)
+    end
+end
+
+replace(f::Callable, t::Tuple; count::Integer=typemax(Int)) =
+    _replace(f, t, check_count(count))
+
+function _replace(t::Tuple, count::Int, old_new::Tuple{Vararg{Pair}})
+    _replace(t, count) do x
+        @_inline_meta
+        for o_n in old_new
+            isequal(first(o_n), x) && return last(o_n)
+        end
+        return x
+    end
+end
+
+replace(t::Tuple, old_new::Pair...; count::Integer=typemax(Int)) =
+    _replace(t, check_count(count), old_new)

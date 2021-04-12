@@ -483,6 +483,22 @@ end
                   "$t of "*sprint((io, t) -> show(io, MIME"text/plain"(), t), parent(Fop))
 end
 
+@testset "showarg" begin
+    io = IOBuffer()
+
+    A = ones(Float64, 3,3)
+
+    B = Adjoint(A)
+    @test summary(B) == "3×3 adjoint(::Matrix{Float64}) with eltype Float64"
+    @test Base.showarg(io, B, false) === nothing
+    @test String(take!(io)) == "adjoint(::Matrix{Float64})"
+
+    B = Transpose(A)
+    @test summary(B) == "3×3 transpose(::Matrix{Float64}) with eltype Float64"
+    @test Base.showarg(io, B, false) === nothing
+    @test String(take!(io)) == "transpose(::Matrix{Float64})"
+end
+
 @testset "strided transposes" begin
     for t in (Adjoint, Transpose)
         @test strides(t(rand(3))) == (3, 1)
@@ -548,6 +564,13 @@ end
     # test if `conj(transpose(::Hermitian))` is a no-op
     hermitian = Hermitian([1 2+im; 2-im 3])
     @test conj(transpose(hermitian)) === hermitian
+end
+
+@testset "empty and mismatched lengths" begin
+    # issue 36678
+    @test_throws DimensionMismatch [1, 2]' * [1,2,3]
+    @test Int[]' * Int[] == 0
+    @test transpose(Int[]) * Int[] == 0
 end
 
 end # module TestAdjointTranspose
