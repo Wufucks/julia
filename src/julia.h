@@ -242,6 +242,7 @@ typedef union __jl_purity_overrides_t {
         // is guaranteed to terminate, but does not make
         // assertions about any called functions.
         uint8_t ipo_terminates_locally : 1;
+        uint8_t ipo_notaskstate : 1;
     } overrides;
     uint8_t bits;
 } _jl_purity_overrides_t;
@@ -683,7 +684,6 @@ extern JL_DLLIMPORT jl_datatype_t *jl_argument_type JL_GLOBALLY_ROOTED;
 extern JL_DLLIMPORT jl_datatype_t *jl_const_type JL_GLOBALLY_ROOTED;
 extern JL_DLLIMPORT jl_datatype_t *jl_partial_struct_type JL_GLOBALLY_ROOTED;
 extern JL_DLLIMPORT jl_datatype_t *jl_partial_opaque_type JL_GLOBALLY_ROOTED;
-extern JL_DLLIMPORT jl_datatype_t *jl_interconditional_type JL_GLOBALLY_ROOTED;
 extern JL_DLLIMPORT jl_datatype_t *jl_method_match_type JL_GLOBALLY_ROOTED;
 extern JL_DLLIMPORT jl_datatype_t *jl_simplevector_type JL_GLOBALLY_ROOTED;
 extern JL_DLLIMPORT jl_typename_t *jl_tuple_typename JL_GLOBALLY_ROOTED;
@@ -1647,7 +1647,9 @@ JL_DLLEXPORT int jl_is_debugbuild(void) JL_NOTSAFEPOINT;
 JL_DLLEXPORT jl_sym_t *jl_get_UNAME(void) JL_NOTSAFEPOINT;
 JL_DLLEXPORT jl_sym_t *jl_get_ARCH(void) JL_NOTSAFEPOINT;
 JL_DLLEXPORT jl_value_t *jl_get_libllvm(void) JL_NOTSAFEPOINT;
+extern JL_DLLIMPORT int jl_n_threadpools;
 extern JL_DLLIMPORT int jl_n_threads;
+extern JL_DLLIMPORT int *jl_n_threads_per_pool;
 
 // environment entries
 JL_DLLEXPORT jl_value_t *jl_environ(int i);
@@ -1721,10 +1723,11 @@ JL_DLLEXPORT const char *jl_get_libdir(void);
 JL_DLLEXPORT void julia_init(JL_IMAGE_SEARCH rel);
 JL_DLLEXPORT void jl_init(void);
 JL_DLLEXPORT void jl_init_with_image(const char *julia_bindir,
-                                     const char *image_relative_path);
+                                     const char *image_path);
 JL_DLLEXPORT const char *jl_get_default_sysimg_path(void);
 JL_DLLEXPORT int jl_is_initialized(void);
 JL_DLLEXPORT void jl_atexit_hook(int status);
+JL_DLLEXPORT void jl_postoutput_hook(void);
 JL_DLLEXPORT void JL_NORETURN jl_exit(int status);
 JL_DLLEXPORT const char *jl_pathname_for_handle(void *handle);
 
@@ -1890,6 +1893,8 @@ typedef struct _jl_task_t {
 // hidden state:
     // id of owning thread - does not need to be defined until the task runs
     _Atomic(int16_t) tid;
+    // threadpool id
+    int8_t threadpoolid;
     // saved gc stack top for context switches
     jl_gcframe_t *gcstack;
     size_t world_age;
@@ -1913,7 +1918,8 @@ typedef struct _jl_task_t {
 
 JL_DLLEXPORT jl_task_t *jl_new_task(jl_function_t*, jl_value_t*, size_t);
 JL_DLLEXPORT void jl_switchto(jl_task_t **pt);
-JL_DLLEXPORT int jl_set_task_tid(jl_task_t *task, int tid) JL_NOTSAFEPOINT;
+JL_DLLEXPORT int jl_set_task_tid(jl_task_t *task, int16_t tid) JL_NOTSAFEPOINT;
+JL_DLLEXPORT int jl_set_task_threadpoolid(jl_task_t *task, int8_t tpid) JL_NOTSAFEPOINT;
 JL_DLLEXPORT void JL_NORETURN jl_throw(jl_value_t *e JL_MAYBE_UNROOTED);
 JL_DLLEXPORT void JL_NORETURN jl_rethrow(void);
 JL_DLLEXPORT void JL_NORETURN jl_sig_throw(void);
@@ -2162,7 +2168,7 @@ typedef struct {
 
 #define jl_root_task (jl_current_task->ptls->root_task)
 
-JL_DLLEXPORT jl_task_t *jl_get_current_task(void) JL_NOTSAFEPOINT;
+JL_DLLEXPORT jl_task_t *jl_get_current_task(void) JL_GLOBALLY_ROOTED JL_NOTSAFEPOINT;
 
 // TODO: we need to pin the task while using this (set pure bit)
 JL_DLLEXPORT jl_jmp_buf *jl_get_safe_restore(void) JL_NOTSAFEPOINT;

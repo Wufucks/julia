@@ -72,9 +72,6 @@ function make_ssa!(ci::CodeInfo, code::Vector{Any}, idx, slot, @nospecialize(typ
 end
 
 function new_to_regular(@nospecialize(stmt), new_offset::Int)
-    if isa(stmt, NewSSAValue)
-        return SSAValue(stmt.id + new_offset)
-    end
     urs = userefs(stmt)
     for op in urs
         val = op[]
@@ -156,8 +153,10 @@ function fixemup!(cond, rename, ir::IRCode, ci::CodeInfo, idx::Int, @nospecializ
                 return nothing
             end
             op[] = x
-        elseif isa(val, GlobalRef) && !(isdefined(val.mod, val.name) && isconst(val.mod, val.name))
-            op[] = NewSSAValue(insert_node!(ir, idx, NewInstruction(val, Any)).id - length(ir.stmts))
+        elseif isa(val, GlobalRef) && !(isdefined(val.mod, val.name) && isconst(val.mod, val.name)) ||
+               (isa(val, Expr) && val.head === :static_parameter)
+            op[] = NewSSAValue(insert_node!(ir, idx,
+                NewInstruction(val, typ_for_val(val, ci, ir.sptypes, idx, Any[]))).id - length(ir.stmts))
         end
     end
     return urs[]

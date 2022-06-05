@@ -1373,7 +1373,9 @@ isbanded(A::AbstractMatrix, kl::Integer, ku::Integer) = istriu(A, kl) && istril(
 """
     isdiag(A) -> Bool
 
-Test whether a matrix is diagonal.
+Test whether a matrix is diagonal in the sense that `iszero(A[i,j])` is true unless `i == j`.
+Note that it is not necessary for `A` to be square;
+if you would also like to check that, you need to check that `size(A, 1) == size(A, 2)`.
 
 # Examples
 ```jldoctest
@@ -1392,6 +1394,22 @@ julia> b = [im 0; 0 -im]
 
 julia> isdiag(b)
 true
+
+julia> c = [1 0 0; 0 2 0]
+2×3 Matrix{Int64}:
+ 1  0  0
+ 0  2  0
+
+julia> isdiag(c)
+true
+
+julia> d = [1 0 0; 0 2 3]
+2×3 Matrix{Int64}:
+ 1  0  0
+ 0  2  3
+
+julia> isdiag(d)
+false
 ```
 """
 isdiag(A::AbstractMatrix) = isbanded(A, 0, 0)
@@ -1790,11 +1808,12 @@ end
 end
 
 """
-    normalize(a::AbstractArray, p::Real=2)
+    normalize(a, p::Real=2)
 
-Normalize the array `a` so that its `p`-norm equals unity,
-i.e. `norm(a, p) == 1`.
-See also [`normalize!`](@ref) and [`norm`](@ref).
+Normalize `a` so that its `p`-norm equals unity,
+i.e. `norm(a, p) == 1`. For scalars, this is similar to sign(a),
+except normalize(0) = NaN.
+See also [`normalize!`](@ref), [`norm`](@ref), and [`sign`](@ref).
 
 # Examples
 ```jldoctest
@@ -1831,6 +1850,14 @@ julia> normalize(a)
  0.154303  0.308607  0.617213
  0.154303  0.308607  0.617213
 
+julia> normalize(3, 1)
+1.0
+
+julia> normalize(-8, 1)
+-1.0
+
+julia> normalize(0, 1)
+NaN
 ```
 """
 function normalize(a::AbstractArray, p::Real = 2)
@@ -1843,3 +1870,6 @@ function normalize(a::AbstractArray, p::Real = 2)
         return T[]
     end
 end
+
+normalize(x) = x / norm(x)
+normalize(x, p::Real) = x / norm(x, p)

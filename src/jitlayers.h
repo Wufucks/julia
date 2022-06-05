@@ -1,5 +1,7 @@
 // This file is a part of Julia. License is MIT: https://julialang.org/license
 
+#include <llvm/ADT/MapVector.h>
+
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Module.h>
@@ -14,6 +16,9 @@
 #include <llvm/Target/TargetMachine.h>
 #include "julia_assert.h"
 #include "debug-registry.h"
+
+#include <stack>
+#include <queue>
 
 // As of LLVM 13, there are two runtime JIT linker implementations, the older
 // RuntimeDyld (used via orc::RTDyldObjectLinkingLayer) and the newer JITLink
@@ -48,6 +53,9 @@
 using namespace llvm;
 
 extern "C" jl_cgparams_t jl_default_cgparams;
+
+DEFINE_SIMPLE_CONVERSION_FUNCTIONS(orc::ThreadSafeContext, LLVMOrcThreadSafeContextRef)
+DEFINE_SIMPLE_CONVERSION_FUNCTIONS(orc::ThreadSafeModule, LLVMOrcThreadSafeModuleRef)
 
 void addTargetPasses(legacy::PassManagerBase *PM, const Triple &triple, TargetIRAnalysis analysis);
 void addOptimizationPasses(legacy::PassManagerBase *PM, int opt_level, bool lower_intrinsics=true, bool dump_native=false, bool external_use=false);
@@ -109,19 +117,14 @@ struct jl_returninfo_t {
     unsigned return_roots;
 };
 
-struct jl_llvmf_dump_t {
-    orc::ThreadSafeModule TSM;
-    Function *F;
-};
-
-typedef std::vector<std::tuple<jl_code_instance_t*, jl_returninfo_t::CallingConv, unsigned, llvm::Function*, bool>> jl_codegen_call_targets_t;
+typedef std::tuple<jl_returninfo_t::CallingConv, unsigned, llvm::Function*, bool> jl_codegen_call_target_t;
 
 typedef struct _jl_codegen_params_t {
     orc::ThreadSafeContext tsctx;
     orc::ThreadSafeContext::Lock tsctx_lock;
     typedef StringMap<GlobalVariable*> SymMapGV;
     // outputs
-    jl_codegen_call_targets_t workqueue;
+    std::vector<std::pair<jl_code_instance_t*, jl_codegen_call_target_t>> workqueue;
     std::map<void*, GlobalVariable*> globals;
     std::map<jl_datatype_t*, DIType*> ditypes;
     std::map<jl_datatype_t*, Type*> llvmtypes;
@@ -222,7 +225,15 @@ public:
     typedef orc::IRCompileLayer CompileLayerT;
     typedef orc::IRTransformLayer OptimizeLayerT;
     typedef object::OwningBinary<object::ObjectFile> OwningObj;
-    template<typename ResourceT, size_t max = 0>
+    template
+    <typename ResourceT, size_t max = 0,
+        typename BackingT = std::stack<ResourceT,
+            std::conditional_t<max == 0,
+                SmallVector<ResourceT>,
+                SmallVector<ResourceT, max>
+            >
+        >
+    >
     struct ResourcePool {
         public:
         ResourcePool(std::function<ResourceT()> creator) : creator(std::move(creator)), mutex(std::make_unique<WNMutex>()) {}
@@ -281,7 +292,7 @@ public:
         ResourceT acquire() {
             std::unique_lock<std::mutex> lock(mutex->mutex);
             if (!pool.empty()) {
-                return pool.pop_back_val();
+                return pop(pool);
             }
             if (!max || created < max) {
                 created++;
@@ -289,17 +300,29 @@ public:
             }
             mutex->empty.wait(lock, [&](){ return !pool.empty(); });
             assert(!pool.empty() && "Expected resource pool to have a value!");
-            return pool.pop_back_val();
+            return pop(pool);
         }
         void release(ResourceT &&resource) {
             std::lock_guard<std::mutex> lock(mutex->mutex);
-            pool.push_back(std::move(resource));
+            pool.push(std::move(resource));
             mutex->empty.notify_one();
         }
         private:
+        template<typename T, typename Container>
+        static ResourceT pop(std::queue<T, Container> &pool) {
+            ResourceT top = std::move(pool.front());
+            pool.pop();
+            return top;
+        }
+        template<typename PoolT>
+        static ResourceT pop(PoolT &pool) {
+            ResourceT top = std::move(pool.top());
+            pool.pop();
+            return top;
+        }
         std::function<ResourceT()> creator;
         size_t created = 0;
-        llvm::SmallVector<ResourceT, max == 0 ? 8 : max> pool;
+        BackingT pool;
         struct WNMutex {
             std::mutex mutex;
             std::condition_variable empty;
@@ -413,7 +436,7 @@ private:
     jl_locked_stream dump_compiles_stream;
     jl_locked_stream dump_llvm_opt_stream;
 
-    ResourcePool<orc::ThreadSafeContext> ContextPool;
+    ResourcePool<orc::ThreadSafeContext, 0, std::queue<orc::ThreadSafeContext>> ContextPool;
 
 #ifndef JL_USE_JITLINK
     const std::shared_ptr<RTDyldMemoryManager> MemMgr;

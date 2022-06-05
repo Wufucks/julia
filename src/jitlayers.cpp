@@ -226,7 +226,7 @@ int jl_compile_extern_c_impl(LLVMOrcThreadSafeModuleRef llvmmod, void *p, void *
     if (measure_compile_time_enabled)
         compiler_start_time = jl_hrtime();
     orc::ThreadSafeContext ctx;
-    auto into = reinterpret_cast<orc::ThreadSafeModule*>(llvmmod);
+    auto into = unwrap(llvmmod);
     jl_codegen_params_t *pparams = (jl_codegen_params_t*)p;
     orc::ThreadSafeModule backing;
     if (into == NULL) {
@@ -240,7 +240,7 @@ int jl_compile_extern_c_impl(LLVMOrcThreadSafeModuleRef llvmmod, void *p, void *
     if (pparams == NULL)
         pparams = &params;
     assert(pparams->tsctx.getContext() == into->getContext().getContext());
-    const char *name = jl_generate_ccallable(reinterpret_cast<LLVMOrcThreadSafeModuleRef>(into), sysimg, declrt, sigt, *pparams);
+    const char *name = jl_generate_ccallable(wrap(into), sysimg, declrt, sigt, *pparams);
     bool success = true;
     if (!sysimg) {
         if (jl_ExecutionEngine->getGlobalValueAddress(name)) {
@@ -472,10 +472,11 @@ jl_value_t *jl_dump_method_asm_impl(jl_method_instance_t *mi, size_t world,
     }
 
     // whatever, that didn't work - use the assembler output instead
-    void *F = jl_get_llvmf_defn(mi, world, getwrapper, true, jl_default_cgparams);
-    if (!F)
+    jl_llvmf_dump_t llvmf_dump;
+    jl_get_llvmf_defn(&llvmf_dump, mi, world, getwrapper, true, jl_default_cgparams);
+    if (!llvmf_dump.F)
         return jl_an_empty_string;
-    return jl_dump_function_asm(F, raw_mc, asm_variant, debuginfo, binary);
+    return jl_dump_function_asm(&llvmf_dump, raw_mc, asm_variant, debuginfo, binary);
 }
 
 CodeGenOpt::Level CodeGenOptLevelFor(int optlevel)
@@ -509,7 +510,7 @@ void JuliaOJIT::OptSelLayerT::emit(std::unique_ptr<orc::MaterializationResponsib
                     StringRef val = attr.getValueAsString();
                     if (val != "") {
                         size_t ol = (size_t)val[0] - '0';
-                        if (ol >= 0 && ol < optlevel)
+                        if (ol < optlevel)
                             optlevel = ol;
                     }
                 }
@@ -864,6 +865,9 @@ namespace {
 } // namespace
 
 namespace {
+
+    typedef legacy::PassManager PassManager;
+
     orc::JITTargetMachineBuilder createJTMBFromTM(TargetMachine &TM, int optlevel) {
         return orc::JITTargetMachineBuilder(TM.getTargetTriple())
         .setCPU(TM.getTargetCPU().str())
@@ -899,7 +903,7 @@ namespace {
             swap(*this, other);
             return *this;
         }
-        std::unique_ptr<legacy::PassManager> operator()() {
+        std::unique_ptr<PassManager> operator()() {
             auto PM = std::make_unique<legacy::PassManager>();
             addTargetPasses(PM.get(), TM->getTargetTriple(), TM->getTargetIRAnalysis());
             addOptimizationPasses(PM.get(), optlevel);
@@ -967,7 +971,7 @@ namespace {
         }
     private:
         int optlevel;
-        JuliaOJIT::ResourcePool<std::unique_ptr<legacy::PassManager>> PMs;
+        JuliaOJIT::ResourcePool<std::unique_ptr<PassManager>> PMs;
     };
 
     struct CompilerT : orc::IRCompileLayer::IRCompiler {
@@ -1005,7 +1009,13 @@ JuliaOJIT::JuliaOJIT()
 #endif
     GlobalJD(ES.createBareJITDylib("JuliaGlobals")),
     JD(ES.createBareJITDylib("JuliaOJIT")),
-    ContextPool([](){ return orc::ThreadSafeContext(std::make_unique<LLVMContext>()); }),
+    ContextPool([](){
+        auto ctx = std::make_unique<LLVMContext>();
+#ifdef JL_LLVM_OPAQUE_POINTERS
+        ctx->enableOpaquePointers();
+#endif
+        return orc::ThreadSafeContext(std::move(ctx));
+    }),
 #ifdef JL_USE_JITLINK
     // TODO: Port our memory management optimisations to JITLink instead of using the
     // default InProcessMemoryManager.

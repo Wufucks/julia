@@ -1215,6 +1215,7 @@ void jl_precompute_memoized_dt(jl_datatype_t *dt, int cacheable)
         if (dt->isdispatchtuple) {
             dt->isdispatchtuple = jl_is_datatype(p) &&
                 ((!jl_is_kind(p) && ((jl_datatype_t*)p)->isconcretetype) ||
+                 (p == (jl_value_t*)jl_typeofbottom_type) || // == Type{Union{}}, so needs to be consistent
                  (((jl_datatype_t*)p)->name == jl_type_typename && !((jl_datatype_t*)p)->hasfreetypevars));
         }
         if (istuple && dt->has_concrete_subtype) {
@@ -2319,7 +2320,7 @@ void jl_init_types(void) JL_GC_DISABLED
     jl_lineinfonode_type =
         jl_new_datatype(jl_symbol("LineInfoNode"), core, jl_any_type, jl_emptysvec,
                         jl_perm_symsvec(5, "module", "method", "file", "line", "inlined_at"),
-                        jl_svec(5, jl_module_type, jl_any_type, jl_symbol_type, jl_long_type, jl_long_type),
+                        jl_svec(5, jl_module_type, jl_any_type, jl_symbol_type, jl_int32_type, jl_int32_type),
                         jl_emptysvec, 0, 0, 5);
 
     jl_gotonode_type =
@@ -2574,11 +2575,6 @@ void jl_init_types(void) JL_GC_DISABLED
                                        jl_perm_symsvec(2, "typ", "fields"),
                                        jl_svec2(jl_datatype_type, jl_array_any_type),
                                        jl_emptysvec, 0, 0, 2);
-
-    jl_interconditional_type = jl_new_datatype(jl_symbol("InterConditional"), core, jl_any_type, jl_emptysvec,
-                                          jl_perm_symsvec(3, "slot", "vtype", "elsetype"),
-                                          jl_svec(3, jl_long_type, jl_any_type, jl_any_type),
-                                          jl_emptysvec, 0, 0, 3);
 
     jl_method_match_type = jl_new_datatype(jl_symbol("MethodMatch"), core, jl_any_type, jl_emptysvec,
                                        jl_perm_symsvec(4, "spec_types", "sparams", "method", "fully_covers"),

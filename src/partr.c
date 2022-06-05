@@ -50,7 +50,7 @@ uint64_t io_wakeup_leave;
 uv_mutex_t *sleep_locks;
 uv_cond_t *wake_signals;
 
-JL_DLLEXPORT int jl_set_task_tid(jl_task_t *task, int tid) JL_NOTSAFEPOINT
+JL_DLLEXPORT int jl_set_task_tid(jl_task_t *task, int16_t tid) JL_NOTSAFEPOINT
 {
     // Try to acquire the lock on this task.
     int16_t was = jl_atomic_load_relaxed(&task->tid);
@@ -61,10 +61,17 @@ JL_DLLEXPORT int jl_set_task_tid(jl_task_t *task, int tid) JL_NOTSAFEPOINT
     return 0;
 }
 
+JL_DLLEXPORT int jl_set_task_threadpoolid(jl_task_t *task, int8_t tpid) JL_NOTSAFEPOINT
+{
+    if (tpid < 0 || tpid >= jl_n_threadpools)
+        return 0;
+    task->threadpoolid = tpid;
+    return 1;
+}
+
 // GC functions used
 extern int jl_gc_mark_queue_obj_explicit(jl_gc_mark_cache_t *gc_cache,
                                          jl_gc_mark_sp_t *sp, jl_value_t *obj) JL_NOTSAFEPOINT;
-
 
 // parallel task runtime
 // ---
@@ -77,11 +84,10 @@ JL_DLLEXPORT uint32_t jl_rand_ptls(uint32_t max, uint32_t unbias)
 }
 
 // initialize the threading infrastructure
-// (used only by the main thread)
+// (called only by the main thread)
 void jl_init_threadinginfra(void)
 {
     /* initialize the synchronization trees pool */
-
     sleep_threshold = DEFAULT_THREAD_SLEEP_THRESHOLD;
     char *cp = getenv(THREAD_SLEEP_THRESHOLD_NAME);
     if (cp) {
@@ -90,9 +96,6 @@ void jl_init_threadinginfra(void)
         else
             sleep_threshold = (uint64_t)strtol(cp, NULL, 10);
     }
-
-    jl_ptls_t ptls = jl_current_task->ptls;
-    jl_install_thread_signal_handler(ptls);
 
     int16_t tid;
     sleep_locks = (uv_mutex_t*)calloc(jl_n_threads, sizeof(uv_mutex_t));
@@ -118,7 +121,6 @@ void jl_threadfun(void *arg)
     // warning: this changes `jl_current_task`, so be careful not to call that from this function
     jl_task_t *ct = jl_init_root_task(ptls, stack_lo, stack_hi);
     JL_GC_PROMISE_ROOTED(ct);
-    jl_install_thread_signal_handler(ptls);
 
     // wait for all threads
     jl_gc_state_set(ptls, JL_GC_STATE_SAFE, 0);
