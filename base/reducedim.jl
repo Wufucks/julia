@@ -211,8 +211,8 @@ reducedim_init(f, op::typeof(|), A::AbstractArrayOrBroadcasted, region) = reduce
 let
     BitIntFloat = Union{BitInteger, IEEEFloat}
     T = Union{
-        [AbstractArray{t} for t in uniontypes(BitIntFloat)]...,
-        [AbstractArray{Complex{t}} for t in uniontypes(BitIntFloat)]...}
+        Any[AbstractArray{t} for t in uniontypes(BitIntFloat)]...,
+        Any[AbstractArray{Complex{t}} for t in uniontypes(BitIntFloat)]...}
 
     global function reducedim_init(f, op::Union{typeof(+),typeof(add_sum)}, A::T, region)
         z = zero(f(zero(eltype(A))))
@@ -372,7 +372,7 @@ _mapreduce_dim(f, op, ::_InitialValue, A::AbstractArrayOrBroadcasted, dims) =
     mapreducedim!(f, op, reducedim_init(f, op, A, dims), A)
 
 """
-    reduce(f, A; dims=:, [init])
+    reduce(f, A::AbstractArray; dims=:, [init])
 
 Reduce 2-argument function `f` along dimensions of `A`. `dims` is a vector specifying the
 dimensions to reduce, and the keyword argument `init` is the initial value to use in the
@@ -525,6 +525,8 @@ sum(f, A::AbstractArray; dims)
     sum!(r, A)
 
 Sum elements of `A` over the singleton dimensions of `r`, and write results to `r`.
+Note that since the sum! function is intended to operate without making any allocations,
+the target should not alias with the source.
 
 # Examples
 ```jldoctest
