@@ -7,8 +7,6 @@ using Base:
     IOError, UV_EEXIST, UV_ESRCH,
     Process
 
-using Base.Libc: rand
-
 using Base.Filesystem:
     File, open, JL_O_CREAT, JL_O_RDWR, JL_O_RDONLY, JL_O_EXCL,
     rename, samefile, path_separator
@@ -77,6 +75,7 @@ mutable struct LockMonitor
             lock = new(at, fd, update)
             finalizer(close, lock)
         catch ex
+            update === nothing || close(update)
             tryrmopenfile(at)
             close(fd)
             rethrow(ex)
@@ -100,10 +99,13 @@ end
 function mkpidlock(at::String, proc::Process; kwopts...)
     lock = mkpidlock(at, getpid(proc); kwopts...)
     closer = @async begin
-        wait(proc)
-        close(lock)
+        try
+            wait(proc)
+        finally
+            close(lock)
+        end
     end
-    isdefined(Base, :errormonitor) && Base.errormonitor(closer)
+    Base.errormonitor(closer)
     return lock
 end
 
