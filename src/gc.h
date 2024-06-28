@@ -521,7 +521,7 @@ void gc_mark_loop_serial(jl_ptls_t ptls);
 void gc_mark_loop_parallel(jl_ptls_t ptls, int master);
 void gc_sweep_pool_parallel(jl_ptls_t ptls);
 void gc_free_pages(void);
-void sweep_stack_pools(void);
+void sweep_stack_pools(void) JL_NOTSAFEPOINT;
 void jl_gc_debug_init(void);
 
 // GC pages
@@ -724,8 +724,6 @@ void gc_stats_big_obj(void);
 
 // For debugging
 void gc_count_pool(void);
-
-size_t jl_genericmemory_nbytes(jl_genericmemory_t *a) JL_NOTSAFEPOINT;
 
 JL_DLLEXPORT void jl_enable_gc_logging(int enable);
 JL_DLLEXPORT int jl_is_gc_logging_enabled(void);
