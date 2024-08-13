@@ -23,6 +23,7 @@ TRANSFORMED_CCALL_STAT(jl_gc_safepoint);
 TRANSFORMED_CCALL_STAT(jl_get_ptls_states);
 TRANSFORMED_CCALL_STAT(jl_threadid);
 TRANSFORMED_CCALL_STAT(jl_get_tls_world_age);
+TRANSFORMED_CCALL_STAT(jl_get_world_counter);
 TRANSFORMED_CCALL_STAT(jl_gc_enable_disable_finalizers_internal);
 TRANSFORMED_CCALL_STAT(jl_get_current_task);
 TRANSFORMED_CCALL_STAT(jl_set_next_task);
@@ -553,8 +554,8 @@ static Value *julia_to_native(
     // pass the address of an alloca'd thing, not a box
     // since those are immutable.
     Value *slot = emit_static_alloca(ctx, to);
-    unsigned align = julia_alignment(jlto);
-    cast<AllocaInst>(slot)->setAlignment(Align(align));
+    Align align(julia_alignment(jlto));
+    cast<AllocaInst>(slot)->setAlignment(align);
     setName(ctx.emission_context, slot, "native_convert_buffer");
     if (!jvinfo.ispointer()) {
         jl_aliasinfo_t ai = jl_aliasinfo_t::fromTBAA(ctx, jvinfo.tbaa);
@@ -614,6 +615,8 @@ static void interpret_symbol_arg(jl_codectx_t &ctx, native_sym_arg_t &out, jl_va
         jl_cgval_t arg1 = emit_expr(ctx, arg);
         jl_value_t *ptr_ty = arg1.typ;
         if (!jl_is_cpointer_type(ptr_ty)) {
+            if (!ccall)
+                return;
             const char *errmsg = invalid_symbol_err_msg(ccall);
             emit_cpointercheck(ctx, arg1, errmsg);
         }
@@ -703,14 +706,6 @@ static jl_cgval_t emit_cglobal(jl_codectx_t &ctx, jl_value_t **args, size_t narg
 
     interpret_symbol_arg(ctx, sym, args[1], /*ccall=*/false, false);
 
-    if (sym.f_name == NULL && sym.fptr == NULL && sym.jl_ptr == NULL && sym.gcroot != NULL) {
-        const char *errmsg = invalid_symbol_err_msg(/*ccall=*/false);
-        jl_cgval_t arg1 = emit_expr(ctx, args[1]);
-        emit_type_error(ctx, arg1, literal_pointer_val(ctx, (jl_value_t *)jl_pointer_type), errmsg);
-        JL_GC_POP();
-        return jl_cgval_t();
-    }
-
     if (sym.jl_ptr != NULL) {
         res = sym.jl_ptr;
     }
@@ -719,13 +714,21 @@ static jl_cgval_t emit_cglobal(jl_codectx_t &ctx, jl_value_t **args, size_t narg
         if (ctx.emission_context.imaging_mode)
             jl_printf(JL_STDERR,"WARNING: literal address used in cglobal for %s; code cannot be statically compiled\n", sym.f_name);
     }
-    else {
+    else if (sym.f_name != NULL) {
         if (sym.lib_expr) {
             res = runtime_sym_lookup(ctx, getPointerTy(ctx.builder.getContext()), NULL, sym.lib_expr, sym.f_name, ctx.f);
         }
         else /*if (ctx.emission_context.imaging) */{
             res = runtime_sym_lookup(ctx, getPointerTy(ctx.builder.getContext()), sym.f_lib, NULL, sym.f_name, ctx.f);
         }
+    } else {
+        // Fall back to runtime intrinsic
+        JL_GC_POP();
+        jl_cgval_t argv[2];
+        argv[0] = emit_expr(ctx, args[1]);
+        if (nargs == 2)
+            argv[1] = emit_expr(ctx, args[2]);
+        return emit_runtime_call(ctx, nargs == 1 ? JL_I::cglobal_auto : JL_I::cglobal, argv, nargs);
     }
 
     JL_GC_POP();
@@ -1704,6 +1707,30 @@ static jl_cgval_t emit_ccall(jl_codectx_t &ctx, jl_value_t **args, size_t nargs)
             return mark_or_box_ccall_result(ctx, world_age, retboxed, rt, unionall, static_rt);
         }
     }
+    else if (is_libjulia_func(jl_get_world_counter)) {
+        ++CCALL_STAT(jl_get_world_counter);
+        assert(lrt == ctx.types().T_size);
+        assert(!isVa && !llvmcall && nccallargs == 0);
+        JL_GC_POP();
+        jl_aliasinfo_t ai = jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_const);
+
+        // jl_task_t *ct = jl_current_task;
+        // if (ct->ptls->in_pure_callback)
+        //     return ~(size_t)0;
+        // return jl_atomic_load_acquire(&jl_world_counter);
+        Type *T_int16 = getInt16Ty(ctx.builder.getContext());
+        Value *offset = ConstantInt::get(ctx.types().T_size, offsetof(jl_tls_states_t, in_pure_callback) / sizeof(int16_t));
+        Value *field_ptr = ctx.builder.CreateInBoundsGEP(T_int16, get_current_ptls(ctx), offset);
+        Instruction *in_pure_callback = ai.decorateInst(ctx.builder.CreateAlignedLoad(T_int16,
+            field_ptr, Align(sizeof(int16_t)), "in_pure_callback"));
+        Value *cond = ctx.builder.CreateICmpEQ(in_pure_callback, ConstantInt::get(T_int16, 0));
+
+        Value *world_counter = ctx.builder.CreateAlignedLoad(ctx.types().T_size,
+            prepare_global_in(jl_Module, jlgetworld_global), ctx.types().alignof_ptr);
+        cast<LoadInst>(world_counter)->setOrdering(AtomicOrdering::Acquire);
+        Value *ret = ctx.builder.CreateSelect(cond, world_counter, ConstantInt::get(ctx.types().T_size, ~(size_t)0));
+        return mark_or_box_ccall_result(ctx, ret, retboxed, rt, unionall, static_rt);
+    }
     else if (is_libjulia_func(jl_gc_disable_finalizers_internal)
 #ifdef NDEBUG
              || is_libjulia_func(jl_gc_enable_finalizers_internal)
@@ -2081,7 +2108,7 @@ jl_cgval_t function_sig_t::emit_a_ccall(
                 if (!isa<Function>(llvmf) || cast<Function>(llvmf)->isIntrinsic() || cast<Function>(llvmf)->getFunctionType() != functype)
                     llvmf = NULL;
             }
-            else if (f_name.startswith("llvm.")) {
+            else if (f_name.starts_with("llvm.")) {
                 // compute and verify auto-mangling for intrinsic name
                 auto ID = Function::lookupIntrinsicID(f_name);
                 if (ID != Intrinsic::not_intrinsic) {
@@ -2203,7 +2230,7 @@ jl_cgval_t function_sig_t::emit_a_ccall(
                 Value *strct = emit_allocobj(ctx, (jl_datatype_t*)rt, true);
                 setName(ctx.emission_context, strct, "ccall_ret_box");
                 MDNode *tbaa = jl_is_mutable(rt) ? ctx.tbaa().tbaa_mutab : ctx.tbaa().tbaa_immut;
-                int boxalign = julia_alignment(rt);
+                Align boxalign(julia_alignment(rt));
                 // copy the data from the return value to the new struct
                 const DataLayout &DL = ctx.builder.GetInsertBlock()->getModule()->getDataLayout();
                 auto resultTy = result->getType();
@@ -2213,8 +2240,8 @@ jl_cgval_t function_sig_t::emit_a_ccall(
                     // When this happens, cast through memory.
                     auto slot = emit_static_alloca(ctx, resultTy);
                     setName(ctx.emission_context, slot, "type_pun_slot");
-                    slot->setAlignment(Align(boxalign));
-                    ctx.builder.CreateAlignedStore(result, slot, Align(boxalign));
+                    slot->setAlignment(boxalign);
+                    ctx.builder.CreateAlignedStore(result, slot, boxalign);
                     jl_aliasinfo_t ai = jl_aliasinfo_t::fromTBAA(ctx, tbaa);
                     emit_memcpy(ctx, strct, ai, slot, ai, rtsz, boxalign, boxalign);
                 }

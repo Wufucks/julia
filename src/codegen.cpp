@@ -956,7 +956,7 @@ static const auto jlboundp_func = new JuliaFunction<>{
     [](LLVMContext &C) {
         auto T_pjlvalue = JuliaType::get_pjlvalue_ty(C);
         return FunctionType::get(getInt32Ty(C),
-                {T_pjlvalue, T_pjlvalue}, false);
+                {T_pjlvalue, T_pjlvalue, getInt32Ty(C)}, false);
     },
     nullptr,
 };
@@ -2180,7 +2180,7 @@ static GlobalVariable *get_pointer_to_constant(jl_codegen_params_t &emission_con
             gv = get_gv(gvname);
         }
     }
-    assert(gv->getName().startswith(name.str()));
+    assert(gv->getName().starts_with(name.str()));
     assert(val == gv->getInitializer());
     return gv;
 }
@@ -3374,11 +3374,14 @@ static size_t emit_masked_bits_compare(callback &emit_desc, jl_datatype_t *aty, 
     size_t padding_bytes = 0;
     size_t nfields = jl_datatype_nfields(aty);
     size_t total_size = jl_datatype_size(aty);
+    assert(aty->layout->flags.isbitsegal);
     for (size_t i = 0; i < nfields; ++i) {
         size_t offset = jl_field_offset(aty, i);
         size_t fend = i == nfields - 1 ? total_size : jl_field_offset(aty, i + 1);
         size_t fsz = jl_field_size(aty, i);
         jl_datatype_t *fty = (jl_datatype_t*)jl_field_type(aty, i);
+        assert(jl_is_datatype(fty)); // union fields should never reach here
+        assert(fty->layout->flags.isbitsegal);
         if (jl_field_isptr(aty, i) || !fty->layout->flags.haspadding) {
             // The field has no internal padding
             data_bytes += fsz;
@@ -5188,29 +5191,25 @@ static jl_cgval_t emit_invoke(jl_codectx_t &ctx, const jl_cgval_t &lival, ArrayR
                     }
 
                     // Check if it is already compiled (either JIT or externally)
-                    if (cache_valid) {
+                    if (need_to_emit && cache_valid) {
                         // optimization: emit the correct name immediately, if we know it
                         // TODO: use `emitted` map here too to try to consolidate names?
-                        // WARNING: isspecsig is protected by the codegen-lock. If that lock is removed, then the isspecsig load needs to be properly atomically sequenced with this.
-                        auto fptr = jl_atomic_load_relaxed(&codeinst->specptr.fptr);
-                        if (fptr) {
-                            while (!(jl_atomic_load_acquire(&codeinst->specsigflags) & 0b10)) {
-                                jl_cpu_pause();
-                            }
-                            invoke = jl_atomic_load_relaxed(&codeinst->invoke);
-                            if (specsig ? jl_atomic_load_relaxed(&codeinst->specsigflags) & 0b1 : invoke == jl_fptr_args_addr) {
-                                protoname = jl_ExecutionEngine->getFunctionAtAddress((uintptr_t)fptr, codeinst);
-                                if (ctx.external_linkage) {
-                                    // TODO: Add !specsig support to aotcompile.cpp
-                                    // Check that the codeinst is containing native code
-                                    if (specsig && jl_atomic_load_relaxed(&codeinst->specsigflags) & 0b100) {
-                                        external = true;
-                                        need_to_emit = false;
-                                    }
-                                }
-                                else { // ctx.use_cache
+                        uint8_t specsigflags;
+                        jl_callptr_t invoke;
+                        void *fptr;
+                        jl_read_codeinst_invoke(codeinst, &specsigflags, &invoke, &fptr, 0);
+                        if (specsig ? specsigflags & 0b1 : invoke == jl_fptr_args_addr) {
+                            protoname = jl_ExecutionEngine->getFunctionAtAddress((uintptr_t)fptr, invoke, codeinst);
+                            if (ctx.external_linkage) {
+                                // TODO: Add !specsig support to aotcompile.cpp
+                                // Check that the codeinst is containing native code
+                                if (specsig && (specsigflags & 0b100)) {
+                                    external = true;
                                     need_to_emit = false;
                                 }
+                            }
+                            else { // ctx.use_cache
+                                need_to_emit = false;
                             }
                         }
                     }
@@ -5545,7 +5544,7 @@ static jl_cgval_t emit_sparam(jl_codectx_t &ctx, size_t i)
     return mark_julia_type(ctx, sp, true, jl_any_type);
 }
 
-static jl_cgval_t emit_isdefined(jl_codectx_t &ctx, jl_value_t *sym)
+static jl_cgval_t emit_isdefined(jl_codectx_t &ctx, jl_value_t *sym, int allow_import)
 {
     Value *isnull = NULL;
     if (jl_is_slotnumber(sym) || jl_is_argument(sym)) {
@@ -5604,8 +5603,8 @@ static jl_cgval_t emit_isdefined(jl_codectx_t &ctx, jl_value_t *sym)
             modu = ctx.module;
             name = (jl_sym_t*)sym;
         }
-        jl_binding_t *bnd = jl_get_binding(modu, name);
-        if (bnd) {
+        jl_binding_t *bnd = allow_import ? jl_get_binding(modu, name) : jl_get_module_binding(modu, name, 0);
+        if (bnd && jl_atomic_load_relaxed(&bnd->owner) == bnd) {
             if (jl_atomic_load_acquire(&bnd->value) != NULL && bnd->constp)
                 return mark_julia_const(ctx, jl_true);
             Value *bp = julia_binding_gv(ctx, bnd);
@@ -5619,7 +5618,8 @@ static jl_cgval_t emit_isdefined(jl_codectx_t &ctx, jl_value_t *sym)
         else {
             Value *v = ctx.builder.CreateCall(prepare_call(jlboundp_func), {
                     literal_pointer_val(ctx, (jl_value_t*)modu),
-                    literal_pointer_val(ctx, (jl_value_t*)name)
+                    literal_pointer_val(ctx, (jl_value_t*)name),
+                    ConstantInt::get(getInt32Ty(ctx.builder.getContext()), allow_import)
                 });
             isnull = ctx.builder.CreateICmpNE(v, ConstantInt::get(getInt32Ty(ctx.builder.getContext()), 0));
         }
@@ -5655,7 +5655,7 @@ static jl_cgval_t emit_varinfo(jl_codectx_t &ctx, jl_varinfo_t &vi, jl_sym_t *va
             else {
                 const DataLayout &DL = jl_Module->getDataLayout();
                 uint64_t sz = DL.getTypeStoreSize(T);
-                emit_memcpy(ctx, ssaslot, jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_stack), vi.value, sz, ssaslot->getAlign().value(), varslot->getAlign().value());
+                emit_memcpy(ctx, ssaslot, jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_stack), vi.value, sz, ssaslot->getAlign(), varslot->getAlign());
             }
             Value *tindex = NULL;
             if (vi.pTIndex)
@@ -5759,8 +5759,9 @@ static void emit_vi_assignment_unboxed(jl_codectx_t &ctx, jl_varinfo_t &vi, Valu
                 // This check should probably mostly catch the relevant situations.
                 if (vi.value.V != rval_info.V) {
                     Value *copy_bytes = ConstantInt::get(getInt32Ty(ctx.builder.getContext()), jl_datatype_size(vi.value.typ));
+                    Align alignment(julia_alignment(rval_info.typ));
                     emit_memcpy(ctx, vi.value.V, jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_stack), rval_info, copy_bytes,
-                                julia_alignment(rval_info.typ), julia_alignment(rval_info.typ), vi.isVolatile);
+                                alignment, alignment, vi.isVolatile);
                 }
             }
             else {
@@ -6304,8 +6305,13 @@ static jl_cgval_t emit_expr(jl_codectx_t &ctx, jl_value_t *expr, ssize_t ssaidx_
     // however, this is a good way to do it because it should *not* be easy
     // to add new node types.
     if (head == jl_isdefined_sym) {
-        assert(nargs == 1);
-        return emit_isdefined(ctx, args[0]);
+        assert(nargs == 1 || nargs == 2);
+        int allow_import = 1;
+        if (nargs == 2) {
+            assert(jl_is_bool(args[1]));
+            allow_import = args[1] == jl_true;
+        }
+        return emit_isdefined(ctx, args[0], allow_import);
     }
     else if (head == jl_throw_undef_if_not_sym) {
         assert(nargs == 2);
@@ -6731,7 +6737,7 @@ static Value *get_scope_field(jl_codectx_t &ctx)
             "current_scope");
 }
 
-static Function *emit_tojlinvoke(jl_code_instance_t *codeinst, Module *M, jl_codegen_params_t &params)
+static Function *emit_tojlinvoke(jl_code_instance_t *codeinst, StringRef theFptrName, Module *M, jl_codegen_params_t &params)
 {
     ++EmittedToJLInvokes;
     jl_codectx_t ctx(M->getContext(), params, codeinst);
@@ -6748,11 +6754,8 @@ static Function *emit_tojlinvoke(jl_code_instance_t *codeinst, Module *M, jl_cod
     ctx.builder.SetInsertPoint(b0);
     Function *theFunc;
     Value *theFarg;
-    auto invoke = jl_atomic_load_relaxed(&codeinst->invoke);
-    bool cache_valid = params.cache;
 
-    if (cache_valid && invoke != NULL && invoke != &jl_fptr_wait_for_compiled) {
-        StringRef theFptrName = jl_ExecutionEngine->getFunctionAtAddress((uintptr_t)invoke, codeinst);
+    if (!theFptrName.empty()) {
         theFunc = cast<Function>(
             M->getOrInsertFunction(theFptrName, jlinvoke_func->_type(ctx.builder.getContext())).getCallee());
         theFarg = literal_pointer_val(ctx, (jl_value_t*)codeinst);
@@ -6869,8 +6872,9 @@ static void emit_cfunc_invalidate(
             root1 = ctx.builder.CreateConstInBoundsGEP2_32(get_returnroots_type(ctx, return_roots), root1, 0, 0);
             ctx.builder.CreateStore(gf_ret, root1);
         }
+        Align alignment(julia_alignment(rettype));
         emit_memcpy(ctx, &*gf_thunk->arg_begin(), jl_aliasinfo_t::fromTBAA(ctx, nullptr), gf_ret,
-                    jl_aliasinfo_t::fromTBAA(ctx, nullptr), jl_datatype_size(rettype), julia_alignment(rettype), julia_alignment(rettype));
+                    jl_aliasinfo_t::fromTBAA(ctx, nullptr), jl_datatype_size(rettype), Align(alignment), Align(alignment));
         ctx.builder.CreateRetVoid();
         break;
     }
@@ -6919,6 +6923,7 @@ static Function* gen_cfun_wrapper(
     bool nest = (!ff || unionall_env);
     jl_value_t *astrt = (jl_value_t*)jl_any_type;
     void *callptr = NULL;
+    jl_callptr_t invoke = NULL;
     int calltype = 0;
     if (aliasname)
         name = aliasname;
@@ -6927,16 +6932,10 @@ static Function* gen_cfun_wrapper(
     if (lam && params.cache) {
         // TODO: this isn't ideal to be unconditionally calling type inference (and compile) from here
         codeinst = jl_compile_method_internal(lam, world);
-        auto invoke = jl_atomic_load_acquire(&codeinst->invoke);
-        auto fptr = jl_atomic_load_relaxed(&codeinst->specptr.fptr);
+        uint8_t specsigflags;
+        void *fptr;
+        jl_read_codeinst_invoke(codeinst, &specsigflags, &invoke, &fptr, 0);
         assert(invoke);
-        if (fptr) {
-            while (!(jl_atomic_load_acquire(&codeinst->specsigflags) & 0b10)) {
-                jl_cpu_pause();
-            }
-            invoke = jl_atomic_load_relaxed(&codeinst->invoke);
-        }
-        // WARNING: this invoke load is protected by the codegen-lock. If that lock is removed, then the isspecsig load needs to be properly atomically sequenced with this.
         if (invoke == jl_fptr_args_addr) {
             callptr = fptr;
             calltype = 1;
@@ -6946,7 +6945,7 @@ static Function* gen_cfun_wrapper(
             callptr = (void*)codeinst->rettype_const;
             calltype = 2;
         }
-        else if (jl_atomic_load_relaxed(&codeinst->specsigflags) & 0b1) {
+        else if (specsigflags & 0b1) {
             callptr = fptr;
             calltype = 3;
         }
@@ -7224,7 +7223,7 @@ static Function* gen_cfun_wrapper(
         jlfunc_sret = false;
         Function *theFptr = NULL;
         if (calltype == 1) {
-            StringRef fname = jl_ExecutionEngine->getFunctionAtAddress((uintptr_t)callptr, codeinst);
+            StringRef fname = jl_ExecutionEngine->getFunctionAtAddress((uintptr_t)callptr, invoke, codeinst);
             theFptr = cast_or_null<Function>(jl_Module->getNamedValue(fname));
             if (!theFptr) {
                 theFptr = Function::Create(ctx.types().T_jlfunc, GlobalVariable::ExternalLinkage,
@@ -7269,7 +7268,7 @@ static Function* gen_cfun_wrapper(
         assert(calltype == 3);
         // emit a specsig call
         bool gcstack_arg = JL_FEAT_TEST(ctx, gcstack_arg);
-        StringRef protoname = jl_ExecutionEngine->getFunctionAtAddress((uintptr_t)callptr, codeinst);
+        StringRef protoname = jl_ExecutionEngine->getFunctionAtAddress((uintptr_t)callptr, invoke, codeinst);
         jl_returninfo_t returninfo = get_specsig_function(ctx, M, NULL, protoname, lam->specTypes, astrt, is_opaque_closure, gcstack_arg);
         FunctionType *cft = returninfo.decl.getFunctionType();
         jlfunc_sret = (returninfo.cc == jl_returninfo_t::SRet);
@@ -7432,8 +7431,11 @@ static Function* gen_cfun_wrapper(
     ctx.builder.ClearInsertionPoint();
 
     if (aliasname) {
-        GlobalAlias::create(cw->getValueType(), cw->getType()->getAddressSpace(),
+        auto alias = GlobalAlias::create(cw->getValueType(), cw->getType()->getAddressSpace(),
                             GlobalValue::ExternalLinkage, aliasname, cw, M);
+        if(ctx.emission_context.TargetTriple.isOSBinFormatCOFF()) {
+            alias->setDLLStorageClass(GlobalValue::DLLStorageClassTypes::DLLExportStorageClass);
+        }
     }
 
     if (nest) {
@@ -8732,7 +8734,7 @@ static jl_llvm_functions_t
                 jl_cgval_t closure_world = typed_load(ctx, worldaddr, NULL, (jl_value_t*)jl_long_type,
                     nullptr, nullptr, false, AtomicOrdering::NotAtomic, false, ctx.types().alignof_ptr.value());
                 ctx.world_age_at_entry = closure_world.V; // The tls world in a OC is the world of the closure
-                emit_unbox_store(ctx, closure_world, world_age_field, ctx.tbaa().tbaa_gcframe, ctx.types().alignof_ptr.value());
+                emit_unbox_store(ctx, closure_world, world_age_field, ctx.tbaa().tbaa_gcframe, ctx.types().alignof_ptr);
 
                 // Load closure env
                 Value *envaddr = ctx.builder.CreateInBoundsGEP(
@@ -8849,7 +8851,7 @@ static jl_llvm_functions_t
                 !jl_is_submodule(mod, jl_core_module));
     };
     auto in_tracked_path = [] (StringRef file) { // falls within an explicitly set file or directory
-        return jl_options.tracked_path != NULL && file.startswith(jl_options.tracked_path);
+        return jl_options.tracked_path != NULL && file.starts_with(jl_options.tracked_path);
     };
     bool mod_is_user_mod = in_user_mod(ctx.module);
     bool mod_is_tracked = in_tracked_path(ctx.file);
@@ -9275,8 +9277,9 @@ static jl_llvm_functions_t
                     }
                     if (returninfo.cc == jl_returninfo_t::SRet) {
                         assert(jl_is_concrete_type(jlrettype));
+                        Align alignment(julia_alignment(jlrettype));
                         emit_memcpy(ctx, sret, jl_aliasinfo_t::fromTBAA(ctx, nullptr), retvalinfo,
-                                    jl_datatype_size(jlrettype), julia_alignment(jlrettype), julia_alignment(jlrettype));
+                                    jl_datatype_size(jlrettype), alignment, alignment);
                     }
                     else { // must be jl_returninfo_t::Union
                         emit_unionmove(ctx, sret, nullptr, retvalinfo, /*skip*/isboxed_union);
@@ -9514,7 +9517,7 @@ static jl_llvm_functions_t
                     // load of val) if the runtime type of val isn't phiType
                     Value *isvalid = emit_isa_and_defined(ctx, val, phiType);
                     emit_guarded_test(ctx, isvalid, nullptr, [&] {
-                        emit_unbox_store(ctx, update_julia_type(ctx, val, phiType), dest, ctx.tbaa().tbaa_stack, julia_alignment(phiType));
+                        emit_unbox_store(ctx, update_julia_type(ctx, val, phiType), dest, ctx.tbaa().tbaa_stack, Align(julia_alignment(phiType)));
                         return nullptr;
                     });
                 }
@@ -9541,7 +9544,7 @@ static jl_llvm_functions_t
                         if (VN)
                             V = Constant::getNullValue(ctx.types().T_prjlvalue);
                         if (dest)
-                            emit_unbox_store(ctx, val, dest, ctx.tbaa().tbaa_stack, julia_alignment(val.typ));
+                            emit_unbox_store(ctx, val, dest, ctx.tbaa().tbaa_stack, Align(julia_alignment(val.typ)));
                         RTindex = ConstantInt::get(getInt8Ty(ctx.builder.getContext()), tindex);
                     }
                 }
@@ -9641,7 +9644,7 @@ static jl_llvm_functions_t
                     // make sure that anything we attempt to call has some inlining info, just in case optimization messed up
                     // (except if we know that it is an intrinsic used in our prologue, which should never have its own debug subprogram)
                     Function *F = call->getCalledFunction();
-                    if (!in_prologue || !F || !(F->isIntrinsic() || F->getName().startswith("julia.") || &I == restTuple)) {
+                    if (!in_prologue || !F || !(F->isIntrinsic() || F->getName().starts_with("julia.") || &I == restTuple)) {
                         I.setDebugLoc(topdebugloc);
                     }
                 }
@@ -9878,7 +9881,7 @@ jl_llvm_functions_t jl_emit_codeinst(
                         !(params.imaging_mode || jl_options.incremental)) { // don't delete code when generating a precompile file
                 // Never end up in a situation where the codeinst has no invoke, but also no source, so we never fall
                 // through the cracks of SOURCE_MODE_ABI.
-                jl_atomic_store_release(&codeinst->invoke, &jl_fptr_wait_for_compiled);
+                jl_atomic_store_release(&codeinst->invoke, jl_fptr_wait_for_compiled_addr);
                 jl_atomic_store_release(&codeinst->inferred, jl_nothing);
             }
         }
@@ -9904,34 +9907,29 @@ void jl_compile_workqueue(
         // try to emit code for this item from the workqueue
         StringRef preal_decl = "";
         bool preal_specsig = false;
-        auto invoke = jl_atomic_load_acquire(&codeinst->invoke);
-        bool cache_valid = params.cache;
-        // WARNING: isspecsig is protected by the codegen-lock. If that lock is removed, then the isspecsig load needs to be properly atomically sequenced with this.
-        if (cache_valid && invoke != NULL && invoke != &jl_fptr_wait_for_compiled) {
-            auto fptr = jl_atomic_load_relaxed(&codeinst->specptr.fptr);
-            if (fptr) {
-                while (!(jl_atomic_load_acquire(&codeinst->specsigflags) & 0b10)) {
-                    jl_cpu_pause();
-                }
-                // in case we are racing with another thread that is emitting this function
-                invoke = jl_atomic_load_relaxed(&codeinst->invoke);
-            }
+        jl_callptr_t invoke = NULL;
+        if (params.cache) {
+            // WARNING: this correctness is protected by an outer lock
+            uint8_t specsigflags;
+            void *fptr;
+            jl_read_codeinst_invoke(codeinst, &specsigflags, &invoke, &fptr, 0);
+            //if (specsig ? specsigflags & 0b1 : invoke == jl_fptr_args_addr)
             if (invoke == jl_fptr_args_addr) {
-                preal_decl = jl_ExecutionEngine->getFunctionAtAddress((uintptr_t)fptr, codeinst);
+                preal_decl = jl_ExecutionEngine->getFunctionAtAddress((uintptr_t)fptr, invoke, codeinst);
             }
-            else if (jl_atomic_load_relaxed(&codeinst->specsigflags) & 0b1) {
-                preal_decl = jl_ExecutionEngine->getFunctionAtAddress((uintptr_t)fptr, codeinst);
+            else if (specsigflags & 0b1) {
+                preal_decl = jl_ExecutionEngine->getFunctionAtAddress((uintptr_t)fptr, invoke, codeinst);
                 preal_specsig = true;
             }
         }
-        else {
+        if (preal_decl.empty()) {
             auto it = params.compiled_functions.find(codeinst);
             if (it == params.compiled_functions.end()) {
                 // Reinfer the function. The JIT came along and removed the inferred
                 // method body. See #34993
                 if (policy != CompilationPolicy::Default &&
                     jl_atomic_load_relaxed(&codeinst->inferred) == jl_nothing) {
-                    // Codegen lock is held, so SOURCE_MODE_FORCE_SOURCE_UNCACHED is not required
+                    // XXX: SOURCE_MODE_FORCE_SOURCE is wrong here (neither sufficient nor necessary)
                     codeinst = jl_type_infer(codeinst->def, jl_atomic_load_relaxed(&codeinst->max_world), SOURCE_MODE_FORCE_SOURCE);
                 }
                 if (codeinst) {
@@ -9961,7 +9959,10 @@ void jl_compile_workqueue(
             // expected specsig
             if (!preal_specsig) {
                 // emit specsig-to-(jl)invoke conversion
-                Function *preal = emit_tojlinvoke(codeinst, mod, params);
+                StringRef invokeName;
+                if (invoke != NULL)
+                    invokeName = jl_ExecutionEngine->getFunctionAtAddress((uintptr_t)invoke, invoke, codeinst);
+                Function *preal = emit_tojlinvoke(codeinst, invokeName, mod, params);
                 proto.decl->setLinkage(GlobalVariable::InternalLinkage);
                 //protodecl->setAlwaysInline();
                 jl_init_function(proto.decl, params.TargetTriple);
@@ -9978,7 +9979,10 @@ void jl_compile_workqueue(
             // expected non-specsig
             if (preal_decl.empty() || preal_specsig) {
                 // emit jlcall1-to-(jl)invoke conversion
-                preal_decl = emit_tojlinvoke(codeinst, mod, params)->getName();
+                StringRef invokeName;
+                if (invoke != NULL)
+                    invokeName = jl_ExecutionEngine->getFunctionAtAddress((uintptr_t)invoke, invoke, codeinst);
+                preal_decl = emit_tojlinvoke(codeinst, invokeName, mod, params)->getName();
             }
         }
         if (!preal_decl.empty()) {
@@ -10280,8 +10284,6 @@ extern "C" JL_DLLEXPORT_CODEGEN void jl_teardown_codegen_impl() JL_NOTSAFEPOINT
     if (jl_ExecutionEngine)
         jl_ExecutionEngine->printTimers();
     PrintStatistics();
-    JL_LOCK(&jl_codegen_lock); // TODO: If this lock gets removed reconsider
-                                    // LLVM global state/destructors (maybe a rwlock)
 }
 
 // the rest of this file are convenience functions

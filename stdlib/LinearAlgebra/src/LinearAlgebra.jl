@@ -655,10 +655,6 @@ _evview(S::SymTridiagonal) = @view S.ev[begin:begin + length(S.dv) - 2]
 _zeros(::Type{T}, b::AbstractVector, n::Integer) where {T} = zeros(T, max(length(b), n))
 _zeros(::Type{T}, B::AbstractMatrix, n::Integer) where {T} = zeros(T, max(size(B, 1), n), size(B, 2))
 
-# convert to Vector, if necessary
-_makevector(x::Vector) = x
-_makevector(x::AbstractVector) = Vector(x)
-
 # append a zero element / drop the last element
 _pushzero(A) = (B = similar(A, length(A)+1); @inbounds B[begin:end-1] .= A; @inbounds B[end] = zero(eltype(B)); B)
 _droplast!(A) = deleteat!(A, lastindex(A))
@@ -669,9 +665,16 @@ matprod_dest(A, B::StructuredMatrix, TS) = similar(A, TS, size(A))
 matprod_dest(A::StructuredMatrix, B, TS) = similar(B, TS, size(B))
 # diagonal is special, as it does not change the structure of the other matrix
 # we call similar without a size to preserve the type of the matrix wherever possible
-matprod_dest(A::StructuredMatrix, B::Diagonal, TS) = similar(A, TS)
-matprod_dest(A::Diagonal, B::StructuredMatrix, TS) = similar(B, TS)
-matprod_dest(A::Diagonal, B::Diagonal, TS) = similar(B, TS)
+# reroute through _matprod_dest_diag to allow speicalizing on the type of the StructuredMatrix
+# without defining methods for both the orderings
+matprod_dest(A::StructuredMatrix, B::Diagonal, TS) = _matprod_dest_diag(A, TS)
+matprod_dest(A::Diagonal, B::StructuredMatrix, TS) = _matprod_dest_diag(B, TS)
+matprod_dest(A::Diagonal, B::Diagonal, TS) = _matprod_dest_diag(B, TS)
+_matprod_dest_diag(A, TS) = similar(A, TS)
+function _matprod_dest_diag(A::SymTridiagonal, TS)
+    n = size(A, 1)
+    Tridiagonal(similar(A, TS, n-1), similar(A, TS, n), similar(A, TS, n-1))
+end
 
 # Special handling for adj/trans vec
 matprod_dest(A::Diagonal, B::AdjOrTransAbsVec, TS) = similar(B, TS)

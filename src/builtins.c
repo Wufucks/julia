@@ -1278,7 +1278,7 @@ JL_CALLABLE(jl_f_isdefined)
             order = jl_memory_order_unordered;
         if (order < jl_memory_order_unordered)
             jl_atomic_error("isdefined: module binding cannot be accessed non-atomically");
-        int bound = jl_boundp(m, s); // seq_cst always
+        int bound = jl_boundp(m, s, 1); // seq_cst always
         return bound ? jl_true : jl_false;
     }
     jl_datatype_t *vt = (jl_datatype_t*)jl_typeof(args[0]);
@@ -2083,6 +2083,12 @@ static int references_name(jl_value_t *p, jl_typename_t *name, int affects_layou
     if (jl_is_uniontype(p)) {
         return references_name(((jl_uniontype_t*)p)->a, name, affects_layout, freevars) ||
                references_name(((jl_uniontype_t*)p)->b, name, affects_layout, freevars);
+    }
+    if (jl_is_vararg(p)) {
+        jl_value_t *T = ((jl_vararg_t*)p)->T;
+        jl_value_t *N = ((jl_vararg_t*)p)->N;
+        return (T && references_name(T, name, affects_layout, freevars)) ||
+               (N && references_name(N, name, affects_layout, freevars));
     }
     if (jl_is_typevar(p))
         return 0; // already checked by unionall, if applicable
